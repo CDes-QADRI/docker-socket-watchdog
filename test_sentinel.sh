@@ -1,6 +1,6 @@
 #!/bin/bash
 # ╔══════════════════════════════════════════════════════════════╗
-# ║      Container Sentinel — Full Integration Test             ║
+# ║      docker-socket-watchdog — Full Integration Test        ║
 # ╚══════════════════════════════════════════════════════════════╝
 #
 # This script tests ALL container events to verify Discord notifications.
@@ -19,7 +19,7 @@ RESET='\033[0m'
 
 echo ""
 echo -e "${CYAN}${BOLD}╔══════════════════════════════════════════════════════════════╗${RESET}"
-echo -e "${CYAN}${BOLD}║      🧪 Container Sentinel — Integration Test Suite        ║${RESET}"
+echo -e "${CYAN}${BOLD}║      🧪 docker-socket-watchdog — Integration Test Suite    ║${RESET}"
 echo -e "${CYAN}${BOLD}╚══════════════════════════════════════════════════════════════╝${RESET}"
 echo ""
 

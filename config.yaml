@@ -1,5 +1,5 @@
 # ╔══════════════════════════════════════════════════════════════╗
-# ║              Container Sentinel Configuration              ║
+# ║              docker-socket-watchdog Configuration          ║
 # ╚══════════════════════════════════════════════════════════════╝
 
 sentinel:

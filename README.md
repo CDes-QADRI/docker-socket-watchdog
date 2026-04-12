@@ -1,4 +1,4 @@
-# 🛡️ Container Sentinel
+# 🛡️ docker-socket-watchdog
 
 **Automated Docker Service Healer** — A Python daemon that monitors your Docker containers, detects crashes and unhealthy states, and heals them with your confirmation via Discord alerts.
 
@@ -90,7 +90,7 @@ docker rm test_sentinel
 ## 📁 Project Structure
 
 ```
-Container Sentinel/
+docker-socket-watchdog/
 ├── sentinel/
 │   ├── __init__.py      # Package metadata
 │   ├── config.py        # Configuration loader
