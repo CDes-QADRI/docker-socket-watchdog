@@ -1,0 +1,46 @@
+# ╔══════════════════════════════════════════════════════════════╗
+# ║              Container Sentinel Configuration              ║
+# ╚══════════════════════════════════════════════════════════════╝
+
+sentinel:
+  # How often to check containers (in seconds)
+  # Default: 300 (5 minutes)
+  check_interval_seconds: 1800
+
+  # Maximum restart attempts before giving up on a container
+  max_restart_attempts: 2
+
+  # Timeout for restart operation (in seconds)
+  restart_timeout: 30
+
+containers:
+  # Watch mode: "all" or "specific"
+  # "all"      → Monitor every container on the system
+  # "specific" → Only monitor containers listed in specific_names
+  watch_mode: "all"
+
+  # If watch_mode is "specific", list container names here
+  specific_names:
+    # - postgres_db
+    # - n8n
+    # - ollama
+    # - redis
+
+  # Containers to always ignore (even in "all" mode)
+  exclude_names:
+    # - some_test_container
+
+alerts:
+  discord:
+    enabled: true
+
+    # Embed styling
+    color_critical: 0xFF3838    # Red — container crashed/exited
+    color_warning: 0xFFB830     # Amber — container unhealthy
+    color_success: 0x2ECC71     # Green — restart successful
+    color_info: 0x3B82F6        # Blue — general info
+    color_startup: 0xA855F7     # Purple — sentinel started
+
+    # Footer branding
+    footer_text: "docker-socket-watchdog"
+    footer_icon: "https://cdn-icons-png.flaticon.com/512/5969/5969059.png"
