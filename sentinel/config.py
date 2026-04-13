@@ -101,6 +101,11 @@ class Config:
         self.discord_enabled = discord_cfg.get("enabled", discord_defaults["enabled"])
         self.discord_webhook_url = os.getenv("DISCORD_WEBHOOK_URL", "")
 
+        # Bot settings (for interactive buttons)
+        self.discord_bot_token = os.getenv("DISCORD_BOT_TOKEN", "")
+        _channel_id = os.getenv("DISCORD_CHANNEL_ID", "")
+        self.discord_channel_id = int(_channel_id) if _channel_id.isdigit() else 0
+
         self.discord_colors = {
             "critical": discord_cfg.get("color_critical", discord_defaults["color_critical"]),
             "warning": discord_cfg.get("color_warning", discord_defaults["color_warning"]),
@@ -133,12 +138,23 @@ class Config:
             log.error(f"Failed to parse config.yaml: {e}")
             return {}
 
+    @property
+    def discord_bot_enabled(self) -> bool:
+        """Check if Discord bot (interactive buttons) is configured."""
+        return bool(self.discord_bot_token and self.discord_channel_id)
+
     def _validate(self):
         """Validate critical configuration values."""
         if self.discord_enabled and not self.discord_webhook_url:
             log.warning(
                 "Discord alerts enabled but DISCORD_WEBHOOK_URL not set in .env — "
                 "alerts will be skipped"
+            )
+
+        if self.discord_bot_token and not self.discord_channel_id:
+            log.warning(
+                "DISCORD_BOT_TOKEN set but DISCORD_CHANNEL_ID missing — "
+                "interactive buttons will be disabled"
             )
 
         if self.watch_mode == "specific" and not self.specific_names:
@@ -163,6 +179,7 @@ class Config:
             f"  Max Restarts     : {self.max_restart_attempts}",
             f"  Restart Timeout  : {self.restart_timeout}s",
             f"  Discord Alerts   : {'✅ Enabled' if self.discord_enabled else '❌ Disabled'}",
+            f"  Discord Bot      : {'✅ Interactive Buttons' if self.discord_bot_enabled else '➖ Not configured'}",
         ]
 
         if self.watch_mode == "specific":

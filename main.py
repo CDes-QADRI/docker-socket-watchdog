@@ -33,11 +33,13 @@ from sentinel.logger import log, print_banner, print_separator, print_container_
 from sentinel.monitor import DockerMonitor, DockerEventListener, ContainerInfo
 from sentinel.healer import ContainerHealer
 from sentinel.alerter import DiscordAlerter
+from sentinel.discord_bot import SentinelBot, is_bot_available
 
 
 # ─── Globals ───────────────────────────────────────────────────────────────────
 
 shutdown_requested = False
+sentinel_bot = None  # Global reference to Discord bot (if enabled)
 
 
 def signal_handler(signum, frame):
@@ -248,6 +250,28 @@ def main():
     # ── Send startup alert ──
     alerter.send_startup(docker_info, config.summary())
 
+    # ── Start Discord Bot (if configured) ──
+    global sentinel_bot
+    if config.discord_bot_enabled and is_bot_available():
+        log.info("🤖 Starting Discord Bot for interactive buttons...")
+        sentinel_bot = SentinelBot(
+            bot_token=config.discord_bot_token,
+            channel_id=config.discord_channel_id,
+            docker_client=monitor.client,
+            config=config,
+        )
+        sentinel_bot.run_in_thread()
+        # Give the bot a moment to connect
+        import time as _t
+        _t.sleep(3)
+    elif config.discord_bot_token and not is_bot_available():
+        log.warning(
+            "DISCORD_BOT_TOKEN is set but discord.py is not installed — "
+            "run: pip install discord.py"
+        )
+    else:
+        log.info("ℹ️ Discord Bot not configured — using webhook-only mode (no interactive buttons)")
+
     # ── Register signal handlers ──
     signal.signal(signal.SIGINT, signal_handler)
     signal.signal(signal.SIGTERM, signal_handler)
@@ -272,7 +296,15 @@ def main():
             for the main thread to handle confirmation.
             """
             # Always send instant Discord notification
-            alerter.send_realtime_event(container_event)
+            # If bot is available, use it for events needing attention (buttons)
+            # Otherwise fall back to webhook
+            if sentinel_bot and container_event.needs_attention:
+                sent = sentinel_bot.send_interactive_alert(container_event)
+                if not sent:
+                    # Fallback to webhook if bot fails
+                    alerter.send_realtime_event(container_event)
+            else:
+                alerter.send_realtime_event(container_event)
 
             # Log to terminal
             log.info(
