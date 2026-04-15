@@ -40,6 +40,47 @@ COLORS = {
 DOCKER_THUMBNAIL = "https://cdn-icons-png.flaticon.com/512/5969/5969059.png"
 SHIELD_ICON = "https://cdn-icons-png.flaticon.com/512/6941/6941697.png"
 
+# Valid container name pattern (Docker allows [a-zA-Z0-9][a-zA-Z0-9_.-]*)
+import re
+_VALID_CONTAINER_NAME = re.compile(r'^[a-zA-Z0-9][a-zA-Z0-9_.\-]{0,127}$')
+
+
+def _is_valid_container_name(name: str) -> bool:
+    """Validate that a container name matches Docker's naming rules."""
+    return bool(name and _VALID_CONTAINER_NAME.match(name))
+
+
+async def _check_authorization(interaction: Interaction, authorized_role_ids: list) -> bool:
+    """
+    Check if the user clicking a button is authorized.
+    Returns True if authorized, False if denied (sends ephemeral denial message).
+    """
+    if not authorized_role_ids:
+        return True  # No roles configured = allow everyone
+
+    # Server admins always allowed
+    if interaction.user.guild_permissions.administrator:
+        return True
+
+    user_role_ids = {role.id for role in interaction.user.roles}
+    if user_role_ids & set(authorized_role_ids):
+        return True
+
+    # Deny
+    try:
+        await interaction.response.send_message(
+            "🔒 **Access Denied** — You don't have permission to manage containers.\n"
+            "Ask a server admin to add your role to `authorized_role_ids` in config.yaml.",
+            ephemeral=True,
+        )
+    except Exception:
+        pass
+    log.warning(
+        f"🔒 Unauthorized button click by '{interaction.user.display_name}' "
+        f"(ID: {interaction.user.id})"
+    )
+    return False
+
 
 # ─── Restart / Skip View ──────────────────────────────────────────────────────
 
@@ -47,13 +88,14 @@ class ContainerActionView(View):
     """Discord UI View with Restart and Skip buttons for a crashed container."""
 
     def __init__(self, container_name: str, container_id: str, docker_client,
-                 restart_timeout: int = 30):
+                 restart_timeout: int = 30, authorized_role_ids: list = None):
         # timeout=None → buttons never expire while bot is running
         super().__init__(timeout=None)
         self.container_name = container_name
         self.container_id = container_id
         self.docker_client = docker_client
         self.restart_timeout = restart_timeout
+        self.authorized_role_ids = authorized_role_ids or []
 
         # Create buttons with unique custom_ids (container name encoded)
         restart_btn = Button(
@@ -81,6 +123,9 @@ class ContainerActionView(View):
 
     async def restart_callback(self, interaction: Interaction):
         """Handle the Restart button click."""
+        if not await _check_authorization(interaction, self.authorized_role_ids):
+            return
+
         try:
             await interaction.response.defer(ephemeral=False)
         except Exception as e:
@@ -153,7 +198,7 @@ class ContainerActionView(View):
             result_embed = discord.Embed(
                 title="❌ Restart Failed",
                 description=(
-                    f"Failed to restart **{self.container_name}**: `{str(e)[:200]}`"
+                    f"Failed to restart **{self.container_name}**. Check server logs for details."
                 ),
                 color=COLORS["critical"],
                 timestamp=datetime.now(timezone.utc),
@@ -180,6 +225,9 @@ class ContainerActionView(View):
 
     async def skip_callback(self, interaction: Interaction):
         """Handle the Skip button click."""
+        if not await _check_authorization(interaction, self.authorized_role_ids):
+            return
+
         try:
             await interaction.response.defer(ephemeral=False)
         except Exception as e:
@@ -280,12 +328,23 @@ class SentinelBot(discord.Client):
         if interaction.response.is_done():
             return
 
-        # Extract container name from custom_id
+        # Authorization check
+        authorized_roles = self.config.authorized_role_ids if self.config else []
+        if not await _check_authorization(interaction, authorized_roles):
+            return
+
+        # Extract container name from custom_id and validate
         if custom_id.startswith("dsw_restart_"):
             container_name = custom_id[len("dsw_restart_"):]
+            if not _is_valid_container_name(container_name):
+                log.warning(f"🔒 Rejected invalid container name in custom_id: {custom_id[:60]}")
+                return
             await self._handle_persistent_restart(interaction, container_name)
         elif custom_id.startswith("dsw_skip_"):
             container_name = custom_id[len("dsw_skip_"):]
+            if not _is_valid_container_name(container_name):
+                log.warning(f"🔒 Rejected invalid container name in custom_id: {custom_id[:60]}")
+                return
             await self._handle_persistent_skip(interaction, container_name)
 
     async def _handle_persistent_restart(self, interaction: Interaction, container_name: str):
@@ -348,10 +407,11 @@ class SentinelBot(discord.Client):
         except Exception as e:
             result_embed = discord.Embed(
                 title="❌ Restart Failed",
-                description=f"Failed to restart **{container_name}**: `{str(e)[:200]}`",
+                description=f"Failed to restart **{container_name}**. Check server logs for details.",
                 color=COLORS["critical"],
                 timestamp=datetime.now(timezone.utc),
             )
+            log.error(f"Error restarting '{container_name}' via Discord (persistent): {e}")
 
         result_embed.set_footer(text="docker-socket-watchdog", icon_url=DOCKER_THUMBNAIL)
 
@@ -478,11 +538,13 @@ class SentinelBot(discord.Client):
         # Create the view with buttons (only for events needing attention)
         if event.needs_attention:
             timeout = self.config.restart_timeout if self.config else 30
+            authorized = self.config.authorized_role_ids if self.config else []
             view = ContainerActionView(
                 container_name=event.container_name,
                 container_id=event.container_id,
                 docker_client=self.docker_client,
                 restart_timeout=timeout,
+                authorized_role_ids=authorized,
             )
             await channel.send(embed=embed, view=view)
         else:
@@ -549,11 +611,13 @@ class SentinelBot(discord.Client):
         embed.set_footer(text="docker-socket-watchdog", icon_url=DOCKER_THUMBNAIL)
 
         timeout = self.config.restart_timeout if self.config else 30
+        authorized = self.config.authorized_role_ids if self.config else []
         view = ContainerActionView(
             container_name=alert.container_name,
             container_id=alert.container_id,
             docker_client=self.docker_client,
             restart_timeout=timeout,
+            authorized_role_ids=authorized,
         )
         await channel.send(embed=embed, view=view)
 
@@ -670,11 +734,13 @@ class SentinelBot(discord.Client):
         embed.set_footer(text="docker-socket-watchdog", icon_url=DOCKER_THUMBNAIL)
 
         timeout = self.config.restart_timeout if self.config else 30
+        authorized = self.config.authorized_role_ids if self.config else []
         view = ContainerActionView(
             container_name=container_info.name,
             container_id=container_info.id_short,
             docker_client=self.docker_client,
             restart_timeout=timeout,
+            authorized_role_ids=authorized,
         )
         await channel.send(embed=embed, view=view)
 

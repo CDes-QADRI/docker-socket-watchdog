@@ -83,12 +83,18 @@ def setup_logger(name: str = "sentinel", log_level: str = "INFO") -> logging.Log
 
     # ── File Handler ──
     log_dir = os.path.join(os.path.dirname(os.path.dirname(__file__)), "logs")
-    os.makedirs(log_dir, exist_ok=True)
+    os.makedirs(log_dir, mode=0o700, exist_ok=True)
     log_file = os.path.join(log_dir, "sentinel.log")
 
     file_handler = logging.FileHandler(log_file, encoding="utf-8")
     file_handler.setFormatter(SentinelFileFormatter())
     logger.addHandler(file_handler)
+
+    # Restrict log file permissions (owner-only read/write)
+    try:
+        os.chmod(log_file, 0o600)
+    except OSError:
+        pass
 
     return logger
 

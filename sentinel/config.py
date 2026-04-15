@@ -151,6 +151,12 @@ class Config:
             "footer_icon", discord_defaults["footer_icon"]
         )
 
+        # Security: authorized role IDs for button clicks
+        raw_roles = discord_cfg.get("authorized_role_ids", [])
+        self.authorized_role_ids = [
+            int(r) for r in (raw_roles or []) if str(r).isdigit()
+        ]
+
         self._validate()
 
     def _load_yaml(self, path: str) -> dict:
@@ -180,6 +186,18 @@ class Config:
                 "Discord alerts enabled but DISCORD_WEBHOOK_URL not set in .env — "
                 "alerts will be skipped"
             )
+
+        # Validate webhook URL is a legitimate Discord webhook
+        if self.discord_webhook_url and not self.discord_webhook_url.startswith(
+            "https://discord.com/api/webhooks/"
+        ) and not self.discord_webhook_url.startswith(
+            "https://discordapp.com/api/webhooks/"
+        ):
+            log.warning(
+                "DISCORD_WEBHOOK_URL does not look like a valid Discord webhook — "
+                "this could be a security risk (SSRF). Disabling webhook alerts."
+            )
+            self.discord_webhook_url = ""
 
         if self.discord_bot_token and not self.discord_channel_id:
             log.warning(

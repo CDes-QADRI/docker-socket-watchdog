@@ -59,6 +59,13 @@ alerts:
   discord:
     enabled: true
 
+    # Security: Only users with these Discord role IDs can click
+    # Restart/Skip buttons. Leave empty to allow ALL channel members.
+    # To find a role ID: Server Settings → Roles → right-click → Copy ID
+    authorized_role_ids: []
+      # - 123456789012345678
+      # - 987654321098765432
+
     # Embed styling
     color_critical: 0xFF3838    # Red — container crashed/exited
     color_warning: 0xFFB830     # Amber — container unhealthy
