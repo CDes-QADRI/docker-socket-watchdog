@@ -253,10 +253,177 @@ class SentinelBot(discord.Client):
         self._bot_ready.set()
 
     async def setup_hook(self):
-        """Called during bot startup. Set up persistent views."""
-        # Persistent views (timeout=None) are tracked automatically when
-        # sent via channel.send(), but we log setup for debugging.
-        log.info("🔧 Bot setup_hook called — persistent views will be tracked on send")
+        """Called during bot startup."""
+        log.info("🔧 Bot setup_hook — interaction handler ready for cross-session buttons")
+
+    async def on_interaction(self, interaction: Interaction):
+        """
+        Handle button clicks on messages from PREVIOUS bot sessions.
+
+        discord.py's on_interaction fires AFTER View dispatch. If the View
+        is still tracked in memory (current session), View callbacks handle
+        the interaction and this method does nothing (is_done check).
+        For old messages where no View is tracked, we handle them here.
+        """
+        # Only handle component interactions (buttons)
+        if interaction.type != discord.InteractionType.component:
+            return
+
+        custom_id = interaction.data.get("custom_id", "")
+
+        # Check if this is one of our buttons
+        if not custom_id.startswith("dsw_"):
+            return
+
+        # discord.py calls on_interaction AFTER trying to dispatch to
+        # tracked Views. If a tracked View handled it, response is done.
+        if interaction.response.is_done():
+            return
+
+        # Extract container name from custom_id
+        if custom_id.startswith("dsw_restart_"):
+            container_name = custom_id[len("dsw_restart_"):]
+            await self._handle_persistent_restart(interaction, container_name)
+        elif custom_id.startswith("dsw_skip_"):
+            container_name = custom_id[len("dsw_skip_"):]
+            await self._handle_persistent_skip(interaction, container_name)
+
+    async def _handle_persistent_restart(self, interaction: Interaction, container_name: str):
+        """Handle restart button click from a previous bot session's message."""
+        try:
+            await interaction.response.defer(ephemeral=False)
+        except discord.errors.HTTPException as e:
+            if e.code == 40060:
+                # Already acknowledged by a tracked View — skip
+                return
+            log.error(f"Failed to defer persistent restart: {e}")
+            return
+        except Exception as e:
+            log.error(f"Failed to defer persistent restart: {e}")
+            return
+
+        user = interaction.user
+        log.info(f"🔘 Discord user '{user.display_name}' clicked RESTART for '{container_name}' (persistent)")
+
+        loop = asyncio.get_running_loop()
+        try:
+            def _do_restart():
+                container = self.docker_client.containers.get(container_name)
+                timeout = self.config.restart_timeout if self.config else 30
+                container.restart(timeout=timeout)
+                container.reload()
+                return container.status
+
+            new_status = await loop.run_in_executor(None, _do_restart)
+
+            if new_status == "running":
+                result_embed = discord.Embed(
+                    title="✅ Container Restarted via Discord",
+                    description=(
+                        f"**{container_name}** has been restarted successfully "
+                        f"by **{user.display_name}**."
+                    ),
+                    color=COLORS["success"],
+                    timestamp=datetime.now(timezone.utc),
+                )
+                result_embed.add_field(name="📦 Container", value=f"`{container_name}`", inline=True)
+                result_embed.add_field(name="🔄 Status", value="🟢 Running", inline=True)
+                log.info(f"✅ '{container_name}' restarted via Discord by {user.display_name} (persistent)")
+            else:
+                result_embed = discord.Embed(
+                    title="⚠️ Container Restarted But Not Running",
+                    description=f"**{container_name}** is now in `{new_status}` state.",
+                    color=COLORS["warning"],
+                    timestamp=datetime.now(timezone.utc),
+                )
+
+        except docker_sdk.errors.NotFound:
+            result_embed = discord.Embed(
+                title="❌ Container Not Found",
+                description=f"**{container_name}** no longer exists.",
+                color=COLORS["critical"],
+                timestamp=datetime.now(timezone.utc),
+            )
+
+        except Exception as e:
+            result_embed = discord.Embed(
+                title="❌ Restart Failed",
+                description=f"Failed to restart **{container_name}**: `{str(e)[:200]}`",
+                color=COLORS["critical"],
+                timestamp=datetime.now(timezone.utc),
+            )
+
+        result_embed.set_footer(text="docker-socket-watchdog", icon_url=DOCKER_THUMBNAIL)
+
+        # Disable buttons on the original message
+        try:
+            view = View()
+            for child in (interaction.message.components or []):
+                for component in child.children:
+                    btn = Button(
+                        style=component.style,
+                        label=component.label,
+                        custom_id=component.custom_id,
+                        disabled=True,
+                    )
+                    view.add_item(btn)
+            await interaction.message.edit(view=view)
+        except Exception as e:
+            log.debug(f"Could not disable old buttons: {e}")
+
+        try:
+            await interaction.followup.send(embed=result_embed)
+        except Exception as e:
+            log.error(f"Failed to send restart result: {e}")
+
+    async def _handle_persistent_skip(self, interaction: Interaction, container_name: str):
+        """Handle skip button click from a previous bot session's message."""
+        try:
+            await interaction.response.defer(ephemeral=False)
+        except discord.errors.HTTPException as e:
+            if e.code == 40060:
+                # Already acknowledged by a tracked View — skip
+                return
+            log.error(f"Failed to defer persistent skip: {e}")
+            return
+        except Exception as e:
+            log.error(f"Failed to defer persistent skip: {e}")
+            return
+
+        user = interaction.user
+        log.info(f"🔘 Discord user '{user.display_name}' clicked SKIP for '{container_name}' (persistent)")
+
+        result_embed = discord.Embed(
+            title="⏭️ Restart Skipped via Discord",
+            description=(
+                f"**{user.display_name}** chose to skip restarting "
+                f"**{container_name}**."
+            ),
+            color=COLORS["info"],
+            timestamp=datetime.now(timezone.utc),
+        )
+        result_embed.set_footer(text="docker-socket-watchdog", icon_url=DOCKER_THUMBNAIL)
+
+        # Disable buttons on the original message
+        try:
+            view = View()
+            for child in (interaction.message.components or []):
+                for component in child.children:
+                    btn = Button(
+                        style=component.style,
+                        label=component.label,
+                        custom_id=component.custom_id,
+                        disabled=True,
+                    )
+                    view.add_item(btn)
+            await interaction.message.edit(view=view)
+        except Exception as e:
+            log.debug(f"Could not disable old buttons: {e}")
+
+        try:
+            await interaction.followup.send(embed=result_embed)
+        except Exception as e:
+            log.error(f"Failed to send skip result: {e}")
 
     async def on_error(self, event_method, *args, **kwargs):
         """Handle unhandled exceptions in bot event handlers."""
