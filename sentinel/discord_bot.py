@@ -81,7 +81,11 @@ class ContainerActionView(View):
 
     async def restart_callback(self, interaction: Interaction):
         """Handle the Restart button click."""
-        await interaction.response.defer(ephemeral=False)
+        try:
+            await interaction.response.defer(ephemeral=False)
+        except Exception as e:
+            log.error(f"Failed to defer restart interaction: {e}")
+            return
 
         user = interaction.user
         log.info(
@@ -167,9 +171,21 @@ class ContainerActionView(View):
             await interaction.followup.send(embed=result_embed)
         except Exception as e:
             log.error(f"Failed to update Discord message after restart: {e}")
+            try:
+                await interaction.followup.send(
+                    content=f"Action completed but failed to update message: {e}"
+                )
+            except Exception:
+                pass
 
     async def skip_callback(self, interaction: Interaction):
         """Handle the Skip button click."""
+        try:
+            await interaction.response.defer(ephemeral=False)
+        except Exception as e:
+            log.error(f"Failed to defer skip interaction: {e}")
+            return
+
         user = interaction.user
         log.info(
             f"🔘 Discord user '{user.display_name}' clicked SKIP "
@@ -193,10 +209,16 @@ class ContainerActionView(View):
             item.disabled = True
 
         try:
-            await interaction.response.send_message(embed=result_embed)
             await interaction.message.edit(view=self)
+            await interaction.followup.send(embed=result_embed)
         except Exception as e:
             log.error(f"Failed to update Discord message after skip: {e}")
+            try:
+                await interaction.followup.send(
+                    content=f"Skip registered but failed to update message: {e}"
+                )
+            except Exception:
+                pass
 
 
 # ─── Sentinel Discord Bot ────────────────────────────────────────────────────
@@ -229,6 +251,12 @@ class SentinelBot(discord.Client):
         )
         log.info(f"🔗 Bot will send interactive alerts to channel ID: {self.channel_id}")
         self._bot_ready.set()
+
+    async def setup_hook(self):
+        """Called during bot startup. Set up persistent views."""
+        # Persistent views (timeout=None) are tracked automatically when
+        # sent via channel.send(), but we log setup for debugging.
+        log.info("🔧 Bot setup_hook called — persistent views will be tracked on send")
 
     async def on_error(self, event_method, *args, **kwargs):
         """Handle unhandled exceptions in bot event handlers."""
@@ -578,13 +606,20 @@ class SentinelBot(discord.Client):
     def run_in_thread(self):
         """
         Start the bot in a new daemon thread.
+        Uses the proper 'async with self' pattern to ensure setup_hook,
+        view dispatch, and all internal handlers are initialized correctly.
         Returns the thread object.
         """
         def _run():
             try:
                 self._loop = asyncio.new_event_loop()
                 asyncio.set_event_loop(self._loop)
-                self._loop.run_until_complete(self.start(self.bot_token))
+
+                async def _runner():
+                    async with self:
+                        await self.start(self.bot_token)
+
+                self._loop.run_until_complete(_runner())
             except Exception as e:
                 log.error(f"Discord bot crashed: {e}")
                 self._startup_error = e
