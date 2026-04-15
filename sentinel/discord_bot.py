@@ -217,7 +217,7 @@ class SentinelBot(discord.Client):
         self.channel_id = channel_id
         self.docker_client = docker_client
         self.config = config
-        self._ready = threading.Event()
+        self._bot_ready = threading.Event()
         self._loop = None
         self._startup_error = None
 
@@ -228,7 +228,7 @@ class SentinelBot(discord.Client):
             f"(ID: {self.user.id})"
         )
         log.info(f"🔗 Bot will send interactive alerts to channel ID: {self.channel_id}")
-        self._ready.set()
+        self._bot_ready.set()
 
     async def on_error(self, event_method, *args, **kwargs):
         """Handle unhandled exceptions in bot event handlers."""
@@ -367,7 +367,7 @@ class SentinelBot(discord.Client):
         Thread-safe method to send a resource spike alert with buttons.
         Can be called from any thread.
         """
-        if not self._ready.wait(timeout=15):
+        if not self._bot_ready.wait(timeout=15):
             return False
         if self._startup_error:
             return False
@@ -488,7 +488,7 @@ class SentinelBot(discord.Client):
         Thread-safe method to send a scan issue alert with Restart/Skip buttons.
         Can be called from any thread. Returns True if sent via bot, False to fallback.
         """
-        if not self._ready.wait(timeout=15):
+        if not self._bot_ready.wait(timeout=15):
             return False
         if self._startup_error:
             return False
@@ -521,7 +521,7 @@ class SentinelBot(discord.Client):
         Used for info events, scan summaries, etc. so ALL messages
         come from the same bot identity.
         """
-        if not self._ready.wait(timeout=15):
+        if not self._bot_ready.wait(timeout=15):
             return False
         if self._startup_error:
             return False
@@ -553,7 +553,7 @@ class SentinelBot(discord.Client):
         Can be called from any thread — it schedules the coroutine
         on the bot's async event loop.
         """
-        if not self._ready.wait(timeout=15):
+        if not self._bot_ready.wait(timeout=15):
             log.warning("Bot not ready after 15s — falling back to webhook")
             return False
 
@@ -588,7 +588,7 @@ class SentinelBot(discord.Client):
             except Exception as e:
                 log.error(f"Discord bot crashed: {e}")
                 self._startup_error = e
-                self._ready.set()  # Unblock anyone waiting
+                self._bot_ready.set()  # Unblock anyone waiting
 
         thread = threading.Thread(target=_run, daemon=True, name="DiscordBot")
         thread.start()
