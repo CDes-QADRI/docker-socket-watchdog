@@ -294,6 +294,259 @@ class SentinelBot(discord.Client):
             # Informational events — no buttons needed
             await channel.send(embed=embed)
 
+    async def _send_resource_alert(self, alert):
+        """
+        Send a resource spike alert WITH Restart/Skip buttons to Discord.
+        Called from the resource monitor thread via thread-safe scheduling.
+        """
+        channel = self.get_channel(self.channel_id)
+        if not channel:
+            try:
+                channel = await self.fetch_channel(self.channel_id)
+            except Exception as e:
+                raise RuntimeError(f"Cannot access channel {self.channel_id}: {e}")
+
+        color = COLORS.get(alert.severity, COLORS["warning"])
+
+        if alert.severity == "critical":
+            title = f"🚨 CRITICAL — {alert.emoji} Resource Spike!"
+            desc = (
+                f"**{alert.container_name}** is consuming dangerously high resources.\n"
+                f"⚠️ **A crash or OOM kill may be imminent!**"
+            )
+        else:
+            title = f"⚠️ WARNING — {alert.emoji} High Resource Usage"
+            desc = (
+                f"**{alert.container_name}** is exceeding resource thresholds."
+            )
+
+        embed = discord.Embed(
+            title=title,
+            description=desc,
+            color=color,
+            timestamp=datetime.now(timezone.utc),
+        )
+        embed.set_thumbnail(url=DOCKER_THUMBNAIL)
+        embed.add_field(
+            name="📦 Container", value=f"`{alert.container_name}`", inline=True
+        )
+        embed.add_field(
+            name="🏷️ Image", value=f"`{alert.image}`", inline=True
+        )
+        embed.add_field(
+            name="🧠 RAM",
+            value=f"**{alert.mem_percent:.1f}%** ({alert.mem_usage_mb:.0f}MB / {alert.mem_limit_mb:.0f}MB)",
+            inline=True,
+        )
+        embed.add_field(
+            name="🔥 CPU", value=f"**{alert.cpu_percent:.1f}%**", inline=True
+        )
+        embed.add_field(
+            name="⏰ Detected At",
+            value=f"<t:{int(alert.timestamp.timestamp())}:T>",
+            inline=True,
+        )
+        embed.add_field(
+            name="🎯 Action",
+            value="👇 **Click a button below** to restart or skip this container.",
+            inline=False,
+        )
+        embed.set_footer(text="docker-socket-watchdog", icon_url=DOCKER_THUMBNAIL)
+
+        timeout = self.config.restart_timeout if self.config else 30
+        view = ContainerActionView(
+            container_name=alert.container_name,
+            container_id=alert.container_id,
+            docker_client=self.docker_client,
+            restart_timeout=timeout,
+        )
+        await channel.send(embed=embed, view=view)
+
+    def send_resource_alert(self, alert):
+        """
+        Thread-safe method to send a resource spike alert with buttons.
+        Can be called from any thread.
+        """
+        if not self._ready.wait(timeout=15):
+            return False
+        if self._startup_error:
+            return False
+        if not self._loop or self._loop.is_closed():
+            return False
+
+        future = asyncio.run_coroutine_threadsafe(
+            self._send_resource_alert(alert), self._loop
+        )
+        try:
+            future.result(timeout=15)
+            return True
+        except Exception as e:
+            log.error(f"Failed to send resource alert via bot: {e}")
+            return False
+
+    async def _send_issue_alert(self, container_info):
+        """
+        Send a periodic-scan issue alert WITH Restart/Skip buttons via bot.
+        This replaces the webhook-only alerter.send_issue_detected() when
+        the bot is available.
+        """
+        channel = self.get_channel(self.channel_id)
+        if not channel:
+            try:
+                channel = await self.fetch_channel(self.channel_id)
+            except Exception as e:
+                raise RuntimeError(f"Cannot access channel {self.channel_id}: {e}")
+
+        severity = container_info.severity
+        color = COLORS.get(severity, COLORS["warning"])
+
+        if severity == "critical":
+            title = "🚨 CRITICAL — Container Down!"
+            desc = "A container has **crashed** and needs attention."
+        else:
+            title = "⚠️ WARNING — Container Unhealthy"
+            desc = "A container is **not running properly** and may need a restart."
+
+        embed = discord.Embed(
+            title=title,
+            description=desc,
+            color=color,
+            timestamp=datetime.now(timezone.utc),
+        )
+        embed.set_thumbnail(url=DOCKER_THUMBNAIL)
+        embed.add_field(
+            name="📦 Container",
+            value=f"```\n{container_info.name}\n```",
+            inline=True,
+        )
+        embed.add_field(
+            name="🏷️ Image",
+            value=f"```\n{container_info.image}\n```",
+            inline=True,
+        )
+        embed.add_field(
+            name="📊 Status",
+            value=f"```\n{container_info.status.upper()}\n```",
+            inline=True,
+        )
+        embed.add_field(
+            name="🔍 Diagnosis",
+            value=container_info.reason,
+            inline=False,
+        )
+        embed.add_field(
+            name="⏱️ Downtime",
+            value=f"`{container_info.downtime}`",
+            inline=True,
+        )
+        embed.add_field(
+            name="🔢 Exit Code",
+            value=f"`{container_info.exit_code}`",
+            inline=True,
+        )
+        embed.add_field(
+            name="🆔 Container ID",
+            value=f"`{container_info.id_short}`",
+            inline=True,
+        )
+
+        if container_info.error_msg:
+            embed.add_field(
+                name="❌ Error Message",
+                value=f"```\n{container_info.error_msg[:500]}\n```",
+                inline=False,
+            )
+
+        if container_info.oom_killed:
+            embed.add_field(
+                name="💀 OOM Killed",
+                value=(
+                    "Container was killed due to **Out of Memory**.\n"
+                    "Consider increasing memory limits."
+                ),
+                inline=False,
+            )
+
+        embed.add_field(
+            name="🎯 Action",
+            value="👇 **Click a button below** to restart or skip this container.",
+            inline=False,
+        )
+        embed.set_footer(text="docker-socket-watchdog", icon_url=DOCKER_THUMBNAIL)
+
+        timeout = self.config.restart_timeout if self.config else 30
+        view = ContainerActionView(
+            container_name=container_info.name,
+            container_id=container_info.id_short,
+            docker_client=self.docker_client,
+            restart_timeout=timeout,
+        )
+        await channel.send(embed=embed, view=view)
+
+    def send_issue_alert(self, container_info):
+        """
+        Thread-safe method to send a scan issue alert with Restart/Skip buttons.
+        Can be called from any thread. Returns True if sent via bot, False to fallback.
+        """
+        if not self._ready.wait(timeout=15):
+            return False
+        if self._startup_error:
+            return False
+        if not self._loop or self._loop.is_closed():
+            return False
+
+        future = asyncio.run_coroutine_threadsafe(
+            self._send_issue_alert(container_info), self._loop
+        )
+        try:
+            future.result(timeout=15)
+            return True
+        except Exception as e:
+            log.error(f"Failed to send issue alert via bot: {e}")
+            return False
+
+    async def _send_plain_embed(self, embed):
+        """Send a plain embed (no buttons) via the bot channel."""
+        channel = self.get_channel(self.channel_id)
+        if not channel:
+            try:
+                channel = await self.fetch_channel(self.channel_id)
+            except Exception as e:
+                raise RuntimeError(f"Cannot access channel {self.channel_id}: {e}")
+        await channel.send(embed=embed)
+
+    def send_embed(self, embed_dict):
+        """
+        Thread-safe method to send any embed via bot (no buttons).
+        Used for info events, scan summaries, etc. so ALL messages
+        come from the same bot identity.
+        """
+        if not self._ready.wait(timeout=15):
+            return False
+        if self._startup_error:
+            return False
+        if not self._loop or self._loop.is_closed():
+            return False
+
+        async def _send():
+            channel = self.get_channel(self.channel_id)
+            if not channel:
+                try:
+                    channel = await self.fetch_channel(self.channel_id)
+                except Exception as e:
+                    raise RuntimeError(f"Cannot access channel {self.channel_id}: {e}")
+
+            embed = discord.Embed.from_dict(embed_dict)
+            await channel.send(embed=embed)
+
+        future = asyncio.run_coroutine_threadsafe(_send(), self._loop)
+        try:
+            future.result(timeout=15)
+            return True
+        except Exception as e:
+            log.error(f"Failed to send embed via bot: {e}")
+            return False
+
     def send_interactive_alert(self, event):
         """
         Thread-safe method to send an interactive alert.

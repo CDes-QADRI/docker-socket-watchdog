@@ -13,6 +13,31 @@ sentinel:
   # Timeout for restart operation (in seconds)
   restart_timeout: 30
 
+  # ── Resource Monitoring (CPU/RAM Spike Detection) ──
+  # Monitor running containers for high resource usage BEFORE they crash
+  resource_monitoring:
+    enabled: true
+
+    # How often to check resource usage (in seconds)
+    # Lower = faster detection but more Docker API calls
+    check_interval_seconds: 30
+
+    # RAM usage threshold (percentage, 0-100)
+    # Alert when a container exceeds this memory usage
+    ram_threshold_percent: 90
+
+    # CPU usage threshold (percentage, 0-100+)
+    # 100% = one full core; multi-core containers can exceed 100%
+    cpu_threshold_percent: 90
+
+    # How many consecutive threshold breaches before alerting
+    # Prevents alerts from brief, harmless spikes
+    consecutive_breaches: 2
+
+    # Cooldown between alerts for the SAME container (in seconds)
+    # Prevents alert spam if a container stays at high usage
+    alert_cooldown_seconds: 300
+
 containers:
   # Watch mode: "all" or "specific"
   # "all"      → Monitor every container on the system

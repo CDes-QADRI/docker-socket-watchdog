@@ -30,7 +30,7 @@ from colorama import Fore, Style, init as colorama_init
 
 from sentinel.config import Config
 from sentinel.logger import log, print_banner, print_separator, print_container_status
-from sentinel.monitor import DockerMonitor, DockerEventListener, ContainerInfo
+from sentinel.monitor import DockerMonitor, DockerEventListener, ContainerInfo, ResourceMonitor
 from sentinel.healer import ContainerHealer
 from sentinel.alerter import DiscordAlerter
 from sentinel.discord_bot import SentinelBot, is_bot_available
@@ -78,12 +78,12 @@ def handle_problematic_event(event, healer, alerter):
 
 # ─── Periodic Scan Cycle ───────────────────────────────────────────────────────
 
-def run_scan_cycle(monitor, healer, alerter, watch_only=False):
+def run_scan_cycle(monitor, healer, alerter, watch_only=False, bot=None):
     """
     Execute one complete periodic scan cycle:
     1. Scan containers
     2. Display status
-    3. Alert on issues
+    3. Alert on issues (with buttons via bot if available)
     4. Request confirmation & heal (unless watch_only)
     """
     scan_time = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
@@ -141,12 +141,16 @@ def run_scan_cycle(monitor, healer, alerter, watch_only=False):
 
         if watch_only:
             for info in problematic:
-                alerter.send_issue_detected(info)
+                # Try bot (with buttons) first, fall back to webhook
+                if not bot or not bot.send_issue_alert(info):
+                    alerter.send_issue_detected(info)
                 actions_taken.append(f"🔔 `{info.name}` — notified (watch-only mode)")
         else:
             # Send Discord alerts for all problematic containers
             for info in problematic:
-                alerter.send_issue_detected(info)
+                # Try bot (with buttons) first, fall back to webhook
+                if not bot or not bot.send_issue_alert(info):
+                    alerter.send_issue_detected(info)
 
             # Use numbered batch confirmation
             decisions = healer.request_batch_confirmation(problematic)
@@ -279,7 +283,7 @@ def main():
     # ── Run ──
     if args.once:
         log.info("Running single scan (--once mode)")
-        run_scan_cycle(monitor, healer, alerter, watch_only=args.watch_only)
+        run_scan_cycle(monitor, healer, alerter, watch_only=args.watch_only, bot=sentinel_bot)
         log.info("Single scan complete. Exiting.")
     else:
         # ═══════════════════════════════════════════════════════════════════
@@ -296,16 +300,22 @@ def main():
             for the main thread to handle confirmation.
             """
             # Always send instant Discord notification
-            # If bot is available, use it for events needing attention (buttons)
-            # Otherwise fall back to webhook
+            # Route through bot when available (buttons for attention events,
+            # consistent identity for all events)
             bot_handled = False
-            if sentinel_bot and container_event.needs_attention:
-                sent = sentinel_bot.send_interactive_alert(container_event)
-                if sent:
-                    bot_handled = True
+            if sentinel_bot:
+                if container_event.needs_attention:
+                    # Send WITH Restart/Skip buttons
+                    sent = sentinel_bot.send_interactive_alert(container_event)
+                    if sent:
+                        bot_handled = True
+                    else:
+                        alerter.send_realtime_event(container_event)
                 else:
-                    # Fallback to webhook if bot fails
-                    alerter.send_realtime_event(container_event)
+                    # Info events — send through bot without buttons
+                    sent = sentinel_bot.send_interactive_alert(container_event)
+                    if not sent:
+                        alerter.send_realtime_event(container_event)
             else:
                 alerter.send_realtime_event(container_event)
 
@@ -329,6 +339,31 @@ def main():
         )
         events_thread.start()
 
+        # ── Start Resource Monitor Thread (CPU/RAM spikes) ──
+        resource_monitor = None
+        if config.resource_monitoring_enabled:
+            resource_monitor = ResourceMonitor(config, monitor.client)
+
+            def on_resource_alert(alert):
+                """Callback when a container exceeds resource thresholds."""
+                log.warning(
+                    f"{alert.emoji} {alert.container_name} → "
+                    f"{alert.description}"
+                )
+                # Send via bot (with buttons) if available, else webhook
+                bot_sent = False
+                if sentinel_bot:
+                    bot_sent = sentinel_bot.send_resource_alert(alert)
+                if not bot_sent:
+                    alerter.send_resource_alert(alert)
+
+            resource_thread = threading.Thread(
+                target=resource_monitor.run_loop,
+                args=(on_resource_alert,),
+                daemon=True,
+            )
+            resource_thread.start()
+
         interval = config.check_interval
         log.info(
             f"⚡ Real-time event monitoring ACTIVE — "
@@ -340,7 +375,7 @@ def main():
         log.info("Press Ctrl+C to stop\n")
 
         # Initial scan
-        run_scan_cycle(monitor, healer, alerter, watch_only=args.watch_only)
+        run_scan_cycle(monitor, healer, alerter, watch_only=args.watch_only, bot=sentinel_bot)
 
         # ── Main Loop ──
         last_scan_time = time.time()
@@ -388,7 +423,7 @@ def main():
             # Check if it's time for a periodic scan
             try:
                 if time.time() - last_scan_time >= interval:
-                    run_scan_cycle(monitor, healer, alerter, watch_only=args.watch_only)
+                    run_scan_cycle(monitor, healer, alerter, watch_only=args.watch_only, bot=sentinel_bot)
                     last_scan_time = time.time()
             except Exception as e:
                 log.error(f"Error during periodic scan: {e}")
@@ -399,6 +434,8 @@ def main():
 
         # ── Graceful Shutdown ──
         listener.stop()
+        if resource_monitor:
+            resource_monitor.stop()
 
     log.info("Sending shutdown notification...")
     alerter.send_shutdown()

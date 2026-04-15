@@ -20,6 +20,14 @@ DEFAULTS = {
         "check_interval_seconds": 300,
         "max_restart_attempts": 2,
         "restart_timeout": 30,
+        "resource_monitoring": {
+            "enabled": True,
+            "check_interval_seconds": 30,
+            "ram_threshold_percent": 90,
+            "cpu_threshold_percent": 90,
+            "consecutive_breaches": 2,
+            "alert_cooldown_seconds": 300,
+        },
     },
     "containers": {
         "watch_mode": "all",
@@ -77,6 +85,28 @@ class Config:
         self.restart_timeout = sentinel_cfg.get(
             "restart_timeout",
             DEFAULTS["sentinel"]["restart_timeout"],
+        )
+
+        # ── Resource Monitoring Settings ──
+        res_defaults = DEFAULTS["sentinel"]["resource_monitoring"]
+        res_cfg = sentinel_cfg.get("resource_monitoring", {})
+        self.resource_monitoring_enabled = res_cfg.get(
+            "enabled", res_defaults["enabled"]
+        )
+        self.resource_check_interval = res_cfg.get(
+            "check_interval_seconds", res_defaults["check_interval_seconds"]
+        )
+        self.ram_threshold_percent = res_cfg.get(
+            "ram_threshold_percent", res_defaults["ram_threshold_percent"]
+        )
+        self.cpu_threshold_percent = res_cfg.get(
+            "cpu_threshold_percent", res_defaults["cpu_threshold_percent"]
+        )
+        self.resource_consecutive_breaches = res_cfg.get(
+            "consecutive_breaches", res_defaults["consecutive_breaches"]
+        )
+        self.resource_alert_cooldown = res_cfg.get(
+            "alert_cooldown_seconds", res_defaults["alert_cooldown_seconds"]
         )
 
         # ── Container Settings ──
@@ -180,7 +210,13 @@ class Config:
             f"  Restart Timeout  : {self.restart_timeout}s",
             f"  Discord Alerts   : {'✅ Enabled' if self.discord_enabled else '❌ Disabled'}",
             f"  Discord Bot      : {'✅ Interactive Buttons' if self.discord_bot_enabled else '➖ Not configured'}",
+            f"  Resource Monitor : {'✅ Enabled' if self.resource_monitoring_enabled else '❌ Disabled'}",
         ]
+
+        if self.resource_monitoring_enabled:
+            lines.append(
+                f"  RAM / CPU Thresh : {self.ram_threshold_percent}% / {self.cpu_threshold_percent}%"
+            )
 
         if self.watch_mode == "specific":
             lines.append(f"  Watching         : {', '.join(self.specific_names)}")

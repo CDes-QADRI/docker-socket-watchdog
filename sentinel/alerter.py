@@ -449,6 +449,112 @@ class DiscordAlerter:
 
         return self._send(payload)
 
+    # ─── Resource Spike Alert ──────────────────────────────────────────────────
+
+    def send_resource_alert(self, alert):
+        """Send a Discord alert for high CPU/RAM usage before crash."""
+
+        severity = alert.severity
+        color = self.colors.get(severity, self.colors["warning"])
+
+        if severity == "critical":
+            title = f"🚨 CRITICAL — {alert.emoji} Resource Spike Detected!"
+            desc = (
+                f"**{alert.container_name}** is consuming dangerously high resources.\n"
+                f"⚠️ **A crash or OOM kill may be imminent!**"
+            )
+        else:
+            title = f"⚠️ WARNING — {alert.emoji} High Resource Usage"
+            desc = (
+                f"**{alert.container_name}** is exceeding resource thresholds.\n"
+                f"Monitor closely — it may need attention."
+            )
+
+        # Build usage bar visuals
+        ram_bar = self._usage_bar(alert.mem_percent)
+        cpu_bar = self._usage_bar(alert.cpu_percent)
+
+        fields = [
+            {
+                "name": "📦 Container",
+                "value": f"`{alert.container_name}`",
+                "inline": True,
+            },
+            {
+                "name": "🏷️ Image",
+                "value": f"`{alert.image}`",
+                "inline": True,
+            },
+            {
+                "name": "🆔 Container ID",
+                "value": f"`{alert.container_id}`",
+                "inline": True,
+            },
+            {
+                "name": "🧠 RAM Usage",
+                "value": (
+                    f"{ram_bar} **{alert.mem_percent:.1f}%**\n"
+                    f"`{alert.mem_usage_mb:.0f} MB / {alert.mem_limit_mb:.0f} MB`"
+                ),
+                "inline": True,
+            },
+            {
+                "name": "🔥 CPU Usage",
+                "value": (
+                    f"{cpu_bar} **{alert.cpu_percent:.1f}%**"
+                ),
+                "inline": True,
+            },
+            {
+                "name": "⏰ Detected At",
+                "value": f"<t:{int(alert.timestamp.timestamp())}:T>",
+                "inline": True,
+            },
+        ]
+
+        if alert.alert_type in ('ram', 'both') and alert.mem_percent >= 95:
+            fields.append({
+                "name": "💀 Memory Leak Warning",
+                "value": (
+                    "Container is using **>95% RAM** — likely a memory leak.\n"
+                    "Consider restarting before an OOM kill occurs."
+                ),
+                "inline": False,
+            })
+
+        embed = {
+            "title": title,
+            "description": desc,
+            "color": color,
+            "thumbnail": {"url": self.DOCKER_THUMBNAIL},
+            "fields": fields,
+            "footer": {
+                "text": self.footer_text,
+                "icon_url": self.footer_icon,
+            },
+            "timestamp": datetime.now(timezone.utc).isoformat(),
+        }
+
+        payload = {
+            "username": "docker-socket-watchdog",
+            "avatar_url": self.SHIELD_ICON,
+            "embeds": [embed],
+        }
+
+        return self._send(payload)
+
+    @staticmethod
+    def _usage_bar(percent):
+        """Generate a visual usage bar for Discord embeds."""
+        bar_len = 10
+        filled = min(int(percent / 100.0 * bar_len), bar_len)
+        empty = bar_len - filled
+        if percent >= 90:
+            return f"`[{'🟥' * filled}{'⬜' * empty}]`"
+        elif percent >= 70:
+            return f"`[{'🟧' * filled}{'⬜' * empty}]`"
+        return f"`[{'🟩' * filled}{'⬜' * empty}]`"
+
     # ─── Shutdown Alert ────────────────────────────────────────────────────────
 
     def send_shutdown(self):

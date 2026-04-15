@@ -401,3 +401,259 @@ class DockerEventListener:
     def stop(self):
         """Signal the listener to stop."""
         self._stop_event.set()
+
+
+# ─── Resource Alert (CPU/RAM Spike) ────────────────────────────────────────────
+
+class ResourceAlert:
+    """Holds information about a container exceeding resource thresholds."""
+
+    def __init__(self, container_name, container_id, image,
+                 cpu_percent, mem_percent, mem_usage_mb, mem_limit_mb,
+                 alert_type):
+        self.container_name = container_name
+        self.container_id = container_id
+        self.image = image
+        self.cpu_percent = cpu_percent
+        self.mem_percent = mem_percent
+        self.mem_usage_mb = mem_usage_mb
+        self.mem_limit_mb = mem_limit_mb
+        self.alert_type = alert_type  # 'ram', 'cpu', or 'both'
+        self.timestamp = datetime.now(timezone.utc)
+
+    @property
+    def severity(self):
+        if self.mem_percent >= 95 or self.cpu_percent >= 95:
+            return 'critical'
+        return 'warning'
+
+    @property
+    def emoji(self):
+        if self.alert_type == 'ram':
+            return '🧠'
+        elif self.alert_type == 'cpu':
+            return '🔥'
+        return '🧠🔥'
+
+    @property
+    def description(self):
+        parts = []
+        if self.alert_type in ('ram', 'both'):
+            parts.append(f"RAM {self.mem_percent:.1f}%")
+        if self.alert_type in ('cpu', 'both'):
+            parts.append(f"CPU {self.cpu_percent:.1f}%")
+        return f"High Resource Usage — {' / '.join(parts)}"
+
+    def __repr__(self):
+        return (
+            f"<ResourceAlert {self.container_name} "
+            f"cpu={self.cpu_percent:.1f}% mem={self.mem_percent:.1f}%>"
+        )
+
+
+# ─── Resource Monitor ─────────────────────────────────────────────────────────
+
+class ResourceMonitor:
+    """
+    Monitors running containers for CPU/RAM spikes.
+    Alerts BEFORE a container crashes due to resource exhaustion.
+
+    Uses Docker stats API (one-shot, non-streaming) to avoid
+    holding connections open.
+    """
+
+    def __init__(self, config, client):
+        self.config = config
+        self.client = client
+        self._stop_event = threading.Event()
+
+        # Track consecutive breaches per container: {name: count}
+        self._breach_counts = {}
+
+        # Track last alert time per container: {name: timestamp}
+        self._last_alert_time = {}
+
+    def check_resources(self):
+        """
+        Check all running watched containers for resource spikes.
+
+        Returns:
+            list[ResourceAlert]: Alerts for containers exceeding thresholds.
+        """
+        if not self.config.resource_monitoring_enabled:
+            return []
+
+        alerts = []
+
+        try:
+            all_containers = self.client.containers.list(
+                filters={'status': 'running'}
+            )
+        except Exception as e:
+            log.error(f"Failed to list running containers for resource check: {e}")
+            return []
+
+        # Filter using the same watch logic
+        watched = self._filter_running(all_containers)
+
+        # Track which containers we saw this cycle (to clean stale breach counts)
+        seen_names = set()
+
+        for container in watched:
+            name = container.name
+            seen_names.add(name)
+
+            try:
+                stats = container.stats(stream=False)
+            except Exception as e:
+                log.debug(f"Cannot get stats for '{name}': {e}")
+                continue
+
+            cpu_percent = self._calc_cpu_percent(stats)
+            mem_percent, mem_usage_mb, mem_limit_mb = self._calc_mem(stats)
+
+            ram_exceeded = mem_percent >= self.config.ram_threshold_percent
+            cpu_exceeded = cpu_percent >= self.config.cpu_threshold_percent
+
+            if ram_exceeded or cpu_exceeded:
+                self._breach_counts[name] = self._breach_counts.get(name, 0) + 1
+
+                if self._breach_counts[name] >= self.config.resource_consecutive_breaches:
+                    # Check cooldown
+                    now = time.time()
+                    last_alert = self._last_alert_time.get(name, 0)
+                    if now - last_alert < self.config.resource_alert_cooldown:
+                        continue  # Still in cooldown
+
+                    # Determine alert type
+                    if ram_exceeded and cpu_exceeded:
+                        alert_type = 'both'
+                    elif ram_exceeded:
+                        alert_type = 'ram'
+                    else:
+                        alert_type = 'cpu'
+
+                    image = (
+                        str(container.image.tags[0])
+                        if container.image.tags else "unknown"
+                    )
+
+                    alert = ResourceAlert(
+                        container_name=name,
+                        container_id=container.short_id,
+                        image=image,
+                        cpu_percent=cpu_percent,
+                        mem_percent=mem_percent,
+                        mem_usage_mb=mem_usage_mb,
+                        mem_limit_mb=mem_limit_mb,
+                        alert_type=alert_type,
+                    )
+                    alerts.append(alert)
+                    self._last_alert_time[name] = now
+                    # Reset breach count after alerting
+                    self._breach_counts[name] = 0
+            else:
+                # Usage dropped below threshold — reset breach counter
+                self._breach_counts.pop(name, None)
+
+        # Clean stale entries for containers that no longer exist
+        stale = set(self._breach_counts.keys()) - seen_names
+        for s in stale:
+            self._breach_counts.pop(s, None)
+            self._last_alert_time.pop(s, None)
+
+        return alerts
+
+    def _filter_running(self, containers):
+        """Filter running containers using config watch/exclude rules."""
+        filtered = []
+        for container in containers:
+            name = container.name
+            if name in self.config.exclude_names:
+                continue
+            if self.config.watch_mode == 'specific':
+                if name in self.config.specific_names:
+                    filtered.append(container)
+            else:
+                filtered.append(container)
+        return filtered
+
+    @staticmethod
+    def _calc_cpu_percent(stats):
+        """Calculate CPU usage percentage from Docker stats."""
+        try:
+            cpu_stats = stats.get('cpu_stats', {})
+            precpu_stats = stats.get('precpu_stats', {})
+
+            cpu_delta = (
+                cpu_stats.get('cpu_usage', {}).get('total_usage', 0)
+                - precpu_stats.get('cpu_usage', {}).get('total_usage', 0)
+            )
+            system_delta = (
+                cpu_stats.get('system_cpu_usage', 0)
+                - precpu_stats.get('system_cpu_usage', 0)
+            )
+
+            if system_delta > 0 and cpu_delta >= 0:
+                num_cpus = cpu_stats.get('online_cpus', 1) or 1
+                return (cpu_delta / system_delta) * num_cpus * 100.0
+        except (KeyError, TypeError, ZeroDivisionError):
+            pass
+        return 0.0
+
+    @staticmethod
+    def _calc_mem(stats):
+        """
+        Calculate memory usage from Docker stats.
+
+        Returns:
+            tuple: (percent, usage_mb, limit_mb)
+        """
+        try:
+            mem_stats = stats.get('memory_stats', {})
+            usage = mem_stats.get('usage', 0)
+            limit = mem_stats.get('limit', 0)
+
+            # Subtract cache from usage for accurate active memory
+            cache = mem_stats.get('stats', {}).get('cache', 0)
+            active_usage = usage - cache
+
+            if limit > 0 and active_usage >= 0:
+                percent = (active_usage / limit) * 100.0
+                usage_mb = active_usage / (1024 * 1024)
+                limit_mb = limit / (1024 * 1024)
+                return percent, round(usage_mb, 1), round(limit_mb, 1)
+        except (KeyError, TypeError, ZeroDivisionError):
+            pass
+        return 0.0, 0.0, 0.0
+
+    def run_loop(self, callback):
+        """
+        Continuously check resources at configured intervals.
+        Calls callback(ResourceAlert) for each alert.
+        Run this in a daemon thread.
+        """
+        log.info(
+            f"📊 Resource monitor started — "
+            f"checking every {self.config.resource_check_interval}s "
+            f"(RAM ≥{self.config.ram_threshold_percent}% / "
+            f"CPU ≥{self.config.cpu_threshold_percent}%)"
+        )
+
+        while not self._stop_event.is_set():
+            try:
+                alerts = self.check_resources()
+                for alert in alerts:
+                    try:
+                        callback(alert)
+                    except Exception as e:
+                        log.error(f"Error in resource alert callback: {e}")
+            except Exception as e:
+                log.error(f"Resource monitor error: {e}")
+
+            # Use event.wait for interruptible sleep
+            self._stop_event.wait(self.config.resource_check_interval)
+
+    def stop(self):
+        """Signal the monitor to stop."""
+        self._stop_event.set()
