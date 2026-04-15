@@ -298,9 +298,12 @@ def main():
             # Always send instant Discord notification
             # If bot is available, use it for events needing attention (buttons)
             # Otherwise fall back to webhook
+            bot_handled = False
             if sentinel_bot and container_event.needs_attention:
                 sent = sentinel_bot.send_interactive_alert(container_event)
-                if not sent:
+                if sent:
+                    bot_handled = True
+                else:
                     # Fallback to webhook if bot fails
                     alerter.send_realtime_event(container_event)
             else:
@@ -313,8 +316,8 @@ def main():
                 f"{container_event.description}"
             )
 
-            # If it needs attention and not watch-only, queue for confirmation
-            if container_event.needs_attention and not args.watch_only:
+            # Queue for terminal only if bot didn't handle it (avoids race condition)
+            if container_event.needs_attention and not args.watch_only and not bot_handled:
                 event_q.put(container_event)
 
         # Start the real-time event listener in a daemon thread
@@ -346,7 +349,11 @@ def main():
             # Process any queued crash events (from events thread)
             try:
                 event = event_q.get_nowait()
-                result = handle_problematic_event(event, healer, alerter)
+                try:
+                    result = handle_problematic_event(event, healer, alerter)
+                except Exception as e:
+                    log.error(f"Error handling event for '{event.container_name}': {e}")
+                    result = None
                 # If user chose 'skip all', drain remaining events
                 if result == 's':
                     while not event_q.empty():
@@ -356,6 +363,8 @@ def main():
                             if ci:
                                 alerter.send_restart_result(ci, False, skipped=True)
                         except queue.Empty:
+                            break
+                        except Exception:
                             break
                 # If user chose 'restart all', restart remaining events
                 elif result == 'a':
@@ -368,12 +377,21 @@ def main():
                                 alerter.send_restart_result(ci, success=success)
                         except queue.Empty:
                             break
+                        except Exception as e:
+                            log.error(f"Error auto-restarting: {e}")
+                            break
             except queue.Empty:
                 pass
+            except Exception as e:
+                log.error(f"Unexpected error in main loop: {e}")
 
             # Check if it's time for a periodic scan
-            if time.time() - last_scan_time >= interval:
-                run_scan_cycle(monitor, healer, alerter, watch_only=args.watch_only)
+            try:
+                if time.time() - last_scan_time >= interval:
+                    run_scan_cycle(monitor, healer, alerter, watch_only=args.watch_only)
+                    last_scan_time = time.time()
+            except Exception as e:
+                log.error(f"Error during periodic scan: {e}")
                 last_scan_time = time.time()
 
             # Sleep briefly before next iteration

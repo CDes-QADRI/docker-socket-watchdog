@@ -8,6 +8,7 @@ Sends rich, visually stunning embed messages to Discord with:
 - Action confirmation status
 """
 
+import time
 import requests
 from datetime import datetime, timezone
 from sentinel.logger import log
@@ -29,30 +30,49 @@ class DiscordAlerter:
         self.footer_text = config.discord_footer_text
         self.footer_icon = config.discord_footer_icon
 
-    def _send(self, payload: dict) -> bool:
-        """Send a payload to the Discord webhook."""
+    def _send(self, payload: dict, max_retries: int = 3) -> bool:
+        """Send a payload to the Discord webhook with retry logic."""
         if not self.webhook_url:
             log.warning("Discord webhook URL not configured — skipping alert")
             return False
 
-        try:
-            response = requests.post(
-                self.webhook_url,
-                json=payload,
-                timeout=10,
-            )
-            if response.status_code in (200, 204):
-                log.debug("Discord alert sent successfully")
-                return True
-            else:
-                log.error(
-                    f"Discord webhook returned {response.status_code}: "
-                    f"{response.text[:200]}"
+        for attempt in range(1, max_retries + 1):
+            try:
+                response = requests.post(
+                    self.webhook_url,
+                    json=payload,
+                    timeout=10,
                 )
+                if response.status_code in (200, 204):
+                    log.debug("Discord alert sent successfully")
+                    return True
+                elif response.status_code == 429:
+                    retry_after = response.json().get("retry_after", 1)
+                    log.warning(
+                        f"Discord rate limited — retrying in {retry_after}s "
+                        f"(attempt {attempt}/{max_retries})"
+                    )
+                    time.sleep(min(retry_after, 5))
+                    continue
+                else:
+                    log.error(
+                        f"Discord webhook returned {response.status_code}: "
+                        f"{response.text[:200]}"
+                    )
+                    if attempt < max_retries:
+                        time.sleep(1)
+                        continue
+                    return False
+            except requests.RequestException as e:
+                log.error(
+                    f"Failed to send Discord alert "
+                    f"(attempt {attempt}/{max_retries}): {e}"
+                )
+                if attempt < max_retries:
+                    time.sleep(1)
+                    continue
                 return False
-        except requests.RequestException as e:
-            log.error(f"Failed to send Discord alert: {e}")
-            return False
+        return False
 
     # ─── Real-Time Event Alert ─────────────────────────────────────────────────
 

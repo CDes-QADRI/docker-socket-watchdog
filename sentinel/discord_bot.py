@@ -14,6 +14,7 @@ Architecture:
 
 import asyncio
 import threading
+import traceback
 import docker as docker_sdk
 from datetime import datetime, timezone
 from sentinel.logger import log
@@ -71,9 +72,15 @@ class ContainerActionView(View):
         skip_btn.callback = self.skip_callback
         self.add_item(skip_btn)
 
+    def _blocking_restart(self):
+        """Perform blocking Docker restart in thread pool (avoids blocking event loop)."""
+        container = self.docker_client.containers.get(self.container_name)
+        container.restart(timeout=self.restart_timeout)
+        container.reload()
+        return container.status
+
     async def restart_callback(self, interaction: Interaction):
         """Handle the Restart button click."""
-        # Defer immediately to avoid the 3-second timeout
         await interaction.response.defer(ephemeral=False)
 
         user = interaction.user
@@ -82,11 +89,9 @@ class ContainerActionView(View):
             f"for '{self.container_name}'"
         )
 
+        loop = asyncio.get_running_loop()
         try:
-            container = self.docker_client.containers.get(self.container_name)
-            container.restart(timeout=self.restart_timeout)
-            container.reload()
-            new_status = container.status
+            new_status = await loop.run_in_executor(None, self._blocking_restart)
 
             if new_status == "running":
                 result_embed = discord.Embed(
@@ -154,12 +159,14 @@ class ContainerActionView(View):
             )
             log.error(f"Error restarting '{self.container_name}' via Discord: {e}")
 
-        # Disable buttons on the original message
         for item in self.children:
             item.disabled = True
 
-        await interaction.message.edit(view=self)
-        await interaction.followup.send(embed=result_embed)
+        try:
+            await interaction.message.edit(view=self)
+            await interaction.followup.send(embed=result_embed)
+        except Exception as e:
+            log.error(f"Failed to update Discord message after restart: {e}")
 
     async def skip_callback(self, interaction: Interaction):
         """Handle the Skip button click."""
@@ -182,12 +189,14 @@ class ContainerActionView(View):
             text="docker-socket-watchdog", icon_url=DOCKER_THUMBNAIL
         )
 
-        # Disable buttons
         for item in self.children:
             item.disabled = True
 
-        await interaction.response.send_message(embed=result_embed)
-        await interaction.message.edit(view=self)
+        try:
+            await interaction.response.send_message(embed=result_embed)
+            await interaction.message.edit(view=self)
+        except Exception as e:
+            log.error(f"Failed to update Discord message after skip: {e}")
 
 
 # ─── Sentinel Discord Bot ────────────────────────────────────────────────────
@@ -208,8 +217,9 @@ class SentinelBot(discord.Client):
         self.channel_id = channel_id
         self.docker_client = docker_client
         self.config = config
-        self._ready_event = asyncio.Event()
+        self._ready = threading.Event()
         self._loop = None
+        self._startup_error = None
 
     async def on_ready(self):
         """Called when the bot successfully connects to Discord."""
@@ -218,22 +228,23 @@ class SentinelBot(discord.Client):
             f"(ID: {self.user.id})"
         )
         log.info(f"🔗 Bot will send interactive alerts to channel ID: {self.channel_id}")
-        self._ready_event.set()
+        self._ready.set()
+
+    async def on_error(self, event_method, *args, **kwargs):
+        """Handle unhandled exceptions in bot event handlers."""
+        log.error(f"Discord bot error in {event_method}: {traceback.format_exc()}")
 
     async def _send_interactive_alert(self, event):
         """
         Send a crash/issue alert WITH Restart/Skip buttons to Discord.
         Called from the events thread via thread-safe scheduling.
         """
-        await self._ready_event.wait()
-
         channel = self.get_channel(self.channel_id)
         if not channel:
             try:
                 channel = await self.fetch_channel(self.channel_id)
             except Exception as e:
-                log.error(f"Cannot access channel {self.channel_id}: {e}")
-                return
+                raise RuntimeError(f"Cannot access channel {self.channel_id}: {e}")
 
         severity = event.severity
         color = COLORS.get(severity, COLORS["info"])
@@ -289,6 +300,13 @@ class SentinelBot(discord.Client):
         Can be called from any thread — it schedules the coroutine
         on the bot's async event loop.
         """
+        if not self._ready.wait(timeout=15):
+            log.warning("Bot not ready after 15s — falling back to webhook")
+            return False
+
+        if self._startup_error:
+            return False
+
         if not self._loop or self._loop.is_closed():
             log.warning("Bot event loop not available — falling back to webhook")
             return False
@@ -298,8 +316,7 @@ class SentinelBot(discord.Client):
         )
 
         try:
-            # Wait up to 10 seconds for the message to be sent
-            future.result(timeout=10)
+            future.result(timeout=15)
             return True
         except Exception as e:
             log.error(f"Failed to send interactive alert: {e}")
@@ -311,9 +328,14 @@ class SentinelBot(discord.Client):
         Returns the thread object.
         """
         def _run():
-            self._loop = asyncio.new_event_loop()
-            asyncio.set_event_loop(self._loop)
-            self._loop.run_until_complete(self.start(self.bot_token))
+            try:
+                self._loop = asyncio.new_event_loop()
+                asyncio.set_event_loop(self._loop)
+                self._loop.run_until_complete(self.start(self.bot_token))
+            except Exception as e:
+                log.error(f"Discord bot crashed: {e}")
+                self._startup_error = e
+                self._ready.set()  # Unblock anyone waiting
 
         thread = threading.Thread(target=_run, daemon=True, name="DiscordBot")
         thread.start()

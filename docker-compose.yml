@@ -1,0 +1,30 @@
+# ╔══════════════════════════════════════════════════════════════╗
+# ║     docker-socket-watchdog — Docker Compose                 ║
+# ╚══════════════════════════════════════════════════════════════╝
+#
+# Usage:
+#   docker compose up -d          # Start monitoring
+#   docker compose logs -f        # View logs
+#   docker compose down           # Stop
+#
+
+services:
+  watchdog:
+    build: .
+    image: watchdog:latest
+    container_name: container-sentinel
+    restart: unless-stopped
+    volumes:
+      - /var/run/docker.sock:/var/run/docker.sock:ro
+      - ./config.yaml:/app/config.yaml:ro
+      - ./logs:/app/logs
+    env_file:
+      - .env
+    # Override default CMD if you want interactive mode:
+    # command: ["--interval", "60"]
+    healthcheck:
+      test: ["CMD", "python", "-c", "import docker; docker.from_env().ping()"]
+      interval: 60s
+      timeout: 10s
+      retries: 3
+      start_period: 10s

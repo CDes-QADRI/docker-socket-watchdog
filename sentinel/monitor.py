@@ -106,19 +106,24 @@ class DockerMonitor:
         self.client = None
 
     def connect(self) -> bool:
-        """Connect to the Docker daemon."""
-        try:
-            self.client = docker.from_env()
-            self.client.ping()
-            log.info("Connected to Docker daemon")
-            return True
-        except DockerException as e:
-            log.error(f"Cannot connect to Docker daemon: {e}")
-            log.error(
-                "Make sure Docker is running and you have permission "
-                "(try: sudo usermod -aG docker $USER)"
-            )
-            return False
+        """Connect to the Docker daemon with retry."""
+        max_retries = 3
+        for attempt in range(1, max_retries + 1):
+            try:
+                self.client = docker.from_env()
+                self.client.ping()
+                log.info("Connected to Docker daemon")
+                return True
+            except DockerException as e:
+                log.error(f"Cannot connect to Docker daemon (attempt {attempt}/{max_retries}): {e}")
+                if attempt < max_retries:
+                    time.sleep(2)
+                else:
+                    log.error(
+                        "Make sure Docker is running and you have permission "
+                        "(try: sudo usermod -aG docker $USER)"
+                    )
+        return False
 
     def get_docker_info(self) -> dict:
         """Get basic Docker system info."""
@@ -136,7 +141,7 @@ class DockerMonitor:
         except DockerException:
             return {}
 
-    def scan(self) -> tuple[list[ContainerInfo], list]:
+    def scan(self):
         """
         Scan all containers and return problematic ones.
 
