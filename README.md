@@ -1,32 +1,71 @@
 # 🛡️ docker-socket-watchdog
 
-**Automated Docker Service Healer** — A Python daemon that monitors your Docker containers, detects crashes and unhealthy states, and heals them with your confirmation via Discord alerts.
+> **Production-Ready Automated Docker Service Healer & ChatOps Interface**
+
+A Python daemon that directly hooks into the Docker events stream to monitor your containers in real-time. It detects crashes, dead states, and Out-Of-Memory (OOM) events with zero latency, and allows you to heal them instantly via an **interactive two-way Discord Bot**—without ever opening an SSH session or terminal.
 
 ---
 
-## ✨ Features
+## ✨ Enterprise-Grade Features
 
-- 🔍 **Smart Detection** — Monitors containers for `exited`, `dead`, `unhealthy`, and `OOM-killed` states
-- 🔔 **Beautiful Discord Alerts** — Rich embed notifications with color-coded severity, diagnostics, and health bars
-- ✋ **User Confirmation** — Never auto-restarts! Sends alert first, then asks YOU before taking action
-- 🔄 **Auto-Heal** — Restarts problematic containers with retry logic
-- ⚙️ **Flexible Config** — Monitor all containers or specific ones, via `config.yaml`
-- 📊 **Scan Summaries** — After each scan cycle, get a Discord summary with health percentage
-- 🎨 **Beautiful CLI** — Colored terminal output with status icons
+### ⚡ Real-Time Event-Driven Architecture
+Unlike traditional polling cron jobs, the watchdog establishes a continuous stream with the Docker daemon (`/var/run/docker.sock`). It listens for native `die`, `oom`, and `health_status` events and pushes alerts to Discord the millisecond a container stops unexpectedly.
+
+### 🤖 ChatOps Two-Way Interactive Bot
+Say goodbye to manual terminal interventions. When a container crashes, the watchdog sends a rich embed to Discord featuring interactive **[🔄 Restart]** and **[⏭️ Skip]** buttons. You can confidently restart production containers directly from your phone.
+- Uses `discord.py` WebSockets (No inbound open ports or webhooks receiver needed).
+- Fully asynchronous Event Loop decoupled from synchronous Docker SDK calls using thread pools (`loop.run_in_executor`).
+
+### 🛡️ Fallback Background Scans & Healer
+A background safety-net runs periodic full-state scans (configurable, default 30 mins) to ensure no misconfigured containers slip through. If multiple containers fail simultaneously, the terminal UI activates a **Numbered Batch System** allowing you to selectively restart multiple specific containers (e.g., `1,3`) or process all of them via batch actions.
+
+### 🐳 Native Dockerization & Self-Healing
+You can run the Watchdog itself as a lightweight Docker container. It includes advanced retry/self-healing logic to gracefully wait for the host's Docker daemon if it goes offline or restarts.
 
 ---
 
-## 🚀 Quick Start
+## 🚀 Quick Start (Dockerized — Recommended)
+
+The easiest way to deploy the watchdog is via Docker.
+
+### 1. Environment Setup
+Create a `.env` file from the example:
+```bash
+cp .env.example .env
+```
+
+Edit `.env` to add your Discord credentials:
+```env
+# Required for periodic scan summaries and real-time fallbacks
+DISCORD_WEBHOOK_URL=https://discord.com/api/webhooks/...
+
+# Optional (but recommended) — Enables Interactive [Restart] Buttons
+DISCORD_BOT_TOKEN=your_discord_bot_token
+DISCORD_CHANNEL_ID=your_discord_channel_id
+```
+
+### 2. Run via Docker Compose
+```bash
+docker compose up -d
+```
+*The `docker-compose.yml` securely mounts read/write access to `/var/run/docker.sock` required to issue restart commands.*
+
+---
+
+## 🛠️ Local Installation (Virtual Environment)
+
+If you prefer to run it directly on the host machine:
 
 ### 1. Install Dependencies
-
+Requires Python 3.9+
 ```bash
+python3 -m venv venv
+source venv/bin/activate
 pip install -r requirements.txt
 ```
 
-### 2. Configure
-
-Edit `config.yaml` to set your preferences:
+### 2. Configure Settings
+Edit `config.yaml` to set your monitoring preferences (e.g., watch all or specific named containers):
 ```yaml
 containers:
   watch_mode: "all"          # or "specific"
@@ -35,92 +74,66 @@ containers:
     - my_redis
 ```
 
-### 3. Set Discord Webhook
-
-Create a `.env` file (copy from `.env.example`):
+### 3. Execution Modes
 ```bash
-cp .env.example .env
-```
+# Continuous real-time monitoring and Discord Bot activation
+./venv/bin/python main.py
 
-Edit `.env` and add your Discord webhook:
-```env
-DISCORD_WEBHOOK_URL=https://discord.com/api/webhooks/your_webhook_url
-```
+# Watch-only mode (No terminal prompts, relies strictly on Discord actions)
+./venv/bin/python main.py --watch-only
 
-**How to get a webhook URL:**
-1. Open your Discord server → Channel Settings ⚙️
-2. Go to **Integrations** → **Webhooks**
-3. Click **New Webhook** → **Copy Webhook URL**
-
-### 4. Run
-
-```bash
-# Continuous monitoring (every 5 minutes)
-python main.py
-
-# Single scan
-python main.py --once
-
-# Custom interval (e.g., every 60 seconds)
-python main.py --interval 60
+# Single periodic check (Cron-friendly webhook mode)
+./venv/bin/python main.py --once
 ```
 
 ---
 
-## 🧪 Test It
+## 🧪 Integration Testing Suite
+
+The repository includes a comprehensive integration script `test_sentinel.sh` to verify all 14 execution paths (Start, Stop, Kill, Health checks, and Discord webhook propagation).
 
 ```bash
-# 1. Run a test container
-docker run -d --name test_sentinel nginx
+# Start the watchdog in watch-only mode
+./venv/bin/python main.py --watch-only &
 
-# 2. Stop it (simulate crash)
-docker stop test_sentinel
-
-# 3. Start Sentinel with single scan
-python main.py --once
-
-# 4. See the Discord alert & confirm restart in terminal
-
-# 5. Clean up
-docker rm test_sentinel
+# Run the test suite
+bash test_sentinel.sh
 ```
 
 ---
 
-## 📁 Project Structure
+## 📁 Technical Architecture & Project Structure
 
-```
+```text
 docker-socket-watchdog/
 ├── sentinel/
-│   ├── __init__.py      # Package metadata
-│   ├── config.py        # Configuration loader
-│   ├── monitor.py       # Docker health checker
-│   ├── healer.py        # Restart logic + user confirmation
-│   ├── alerter.py       # Discord embed notifications
-│   └── logger.py        # Colored logging
-├── config.yaml          # Your settings
-├── .env                 # Your secrets (gitignored)
-├── .env.example         # Template for .env
-├── main.py              # Entry point
-├── requirements.txt     # Python dependencies
-└── README.md            # This file
+│   ├── discord_bot.py   # asyncio Discord Gateway client & button interaction handlers
+│   ├── monitor.py       # docker-py wrapper & threaded Event Stream generator
+│   ├── alerter.py       # Fallback requests-based Discord webhook sender
+│   ├── healer.py        # Terminal UI numbered batch selection logic
+│   ├── config.py        # Environment & YAML unified configuration parser
+│   └── logger.py        # colorama terminal formatting
+├── config.yaml          # Scan interval and container scoping defaults
+├── docker-compose.yml   # 1-click deployment stack
+├── Dockerfile           # Python Alpine optimization for binary footprints
+├── main.py              # Main Application Thread Controller
+└── test_sentinel.sh     # Bash script mimicking 14 generic container lifecycle events
 ```
 
 ---
 
-## ⚙️ Configuration Reference
+## ⚙️ Configuration Reference (config.yaml)
 
 | Setting | Default | Description |
 |---------|---------|-------------|
-| `check_interval_seconds` | `300` | How often to scan (seconds) |
-| `max_restart_attempts` | `2` | Retry count per container |
-| `restart_timeout` | `30` | Docker restart timeout (seconds) |
-| `watch_mode` | `"all"` | `"all"` or `"specific"` |
-| `specific_names` | `[]` | Container names to watch (when mode=specific) |
-| `exclude_names` | `[]` | Containers to always ignore |
+| `check_interval_seconds` | `1800` | Fallback scan safety net interval (seconds) |
+| `max_restart_attempts` | `2` | Retry logic count per container restart |
+| `restart_timeout` | `30` | Grace period for a container bounds to recover |
+| `watch_mode` | `"all"` | `"all"` or `"specific"` restrictions |
+| `specific_names` | `[]` | Exact container names to monitor |
 
 ---
 
-## 📜 License
+## 📜 Legal & License
 
-MIT — Built as a weekend project with ❤️
+MIT License — Built over the weekend to solve real-world background daemon crashing anxiety. Contributions are welcome!
