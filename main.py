@@ -291,7 +291,9 @@ def main():
         # ═══════════════════════════════════════════════════════════════════
 
         # Queue: events thread puts crash events here → main thread processes
-        event_q = queue.Queue()
+        # Bounded to 100 items to prevent memory exhaustion under event storms.
+        # If full, new events are dropped (Discord alert already sent by that point).
+        event_q = queue.Queue(maxsize=100)
 
         def on_docker_event(container_event):
             """
@@ -328,7 +330,13 @@ def main():
 
             # Queue for terminal only if bot didn't handle it (avoids race condition)
             if container_event.needs_attention and not args.watch_only and not bot_handled:
-                event_q.put(container_event)
+                try:
+                    event_q.put_nowait(container_event)
+                except queue.Full:
+                    log.warning(
+                        f"Event queue full — dropping terminal prompt for "
+                        f"'{container_event.container_name}' (Discord alert already sent)"
+                    )
 
         # Start the real-time event listener in a daemon thread
         listener = DockerEventListener(config, monitor.client)
