@@ -165,12 +165,6 @@ class DockerMonitor:
         # Find problematic containers
         problematic = []
         for container in watched:
-            # Reload to get fresh state
-            try:
-                container.reload()
-            except DockerException:
-                continue
-
             status = container.status
             health = container.attrs.get("State", {}).get("Health", {}).get("Status", "none")
 
