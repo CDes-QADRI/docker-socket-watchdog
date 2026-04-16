@@ -56,6 +56,31 @@ class SentinelFileFormatter(logging.Formatter):
         return f"[{timestamp}] [{record.levelname:<8}] {record.getMessage()}"
 
 
+# ─── Sanitization Filter (File Logs Only) ──────────────────────────────────────
+
+class SanitizeFilter(logging.Filter):
+    """
+    Logging filter that scrubs sensitive data (tokens, passwords, keys)
+    from log messages BEFORE they are written to disk.
+
+    Uses a lazy import to avoid circular dependency (logger ← config ← logger).
+    Applied to the file handler only — console output stays raw for debugging.
+    """
+
+    def filter(self, record: logging.LogRecord) -> bool:
+        try:
+            from sentinel.sanitizer import sanitize
+            record.msg = sanitize(str(record.msg))
+            if record.args:
+                record.args = tuple(
+                    sanitize(str(a)) if isinstance(a, str) else a
+                    for a in record.args
+                )
+        except Exception:
+            pass  # Never block logging due to sanitizer errors
+        return True
+
+
 # ─── Logger Setup ──────────────────────────────────────────────────────────────
 
 def setup_logger(name: str = "sentinel", log_level: str = "INFO") -> logging.Logger:
@@ -88,6 +113,7 @@ def setup_logger(name: str = "sentinel", log_level: str = "INFO") -> logging.Log
 
     file_handler = logging.FileHandler(log_file, encoding="utf-8")
     file_handler.setFormatter(SentinelFileFormatter())
+    file_handler.addFilter(SanitizeFilter())
     logger.addHandler(file_handler)
 
     # Restrict log file permissions (owner-only read/write)
