@@ -11,6 +11,7 @@ import logging
 import os
 import sys
 from datetime import datetime
+from logging.handlers import RotatingFileHandler
 from colorama import Fore, Back, Style, init as colorama_init
 
 # Initialize colorama for cross-platform color support
@@ -106,12 +107,15 @@ def setup_logger(name: str = "sentinel", log_level: str = "INFO") -> logging.Log
     console_handler.setFormatter(SentinelConsoleFormatter())
     logger.addHandler(console_handler)
 
-    # ── File Handler ──
+    # ── File Handler (Rotating — prevents disk exhaustion) ──
     log_dir = os.path.join(os.path.dirname(os.path.dirname(__file__)), "logs")
     os.makedirs(log_dir, mode=0o700, exist_ok=True)
     log_file = os.path.join(log_dir, "sentinel.log")
 
-    file_handler = logging.FileHandler(log_file, encoding="utf-8")
+    # 5 MB per file, keep 3 backups = max 20 MB total
+    file_handler = RotatingFileHandler(
+        log_file, maxBytes=5 * 1024 * 1024, backupCount=3, encoding="utf-8"
+    )
     file_handler.setFormatter(SentinelFileFormatter())
     file_handler.addFilter(SanitizeFilter())
     logger.addHandler(file_handler)
