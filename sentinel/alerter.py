@@ -6,8 +6,12 @@ Sends rich, visually stunning embed messages to Discord with:
 - Detailed container diagnostics
 - Branded footer with timestamps
 - Action confirmation status
+- HMAC-SHA256 payload signing for webhook verification
 """
 
+import hashlib
+import hmac
+import json
 import time
 import requests
 from datetime import datetime, timezone
@@ -29,6 +33,29 @@ class DiscordAlerter:
         self.colors = config.discord_colors
         self.footer_text = config.discord_footer_text
         self.footer_icon = config.discord_footer_icon
+        self.webhook_secret = config.webhook_secret
+
+    def _sign_payload(self, payload_bytes: bytes) -> dict:
+        """
+        Generate HMAC-SHA256 signature headers for a JSON payload.
+
+        Returns extra headers to include in the request. If no
+        WEBHOOK_SECRET is configured, returns an empty dict
+        (backward-compatible — signature is optional).
+        """
+        if not self.webhook_secret:
+            return {}
+
+        signature = hmac.new(
+            self.webhook_secret.encode("utf-8"),
+            payload_bytes,
+            hashlib.sha256,
+        ).hexdigest()
+
+        return {
+            "X-Signature-256": f"sha256={signature}",
+            "X-Sentinel-Event": "docker-socket-watchdog",
+        }
 
     def _send(self, payload: dict, max_retries: int = 3) -> bool:
         """Send a payload to the Discord webhook with retry logic."""
@@ -36,11 +63,18 @@ class DiscordAlerter:
             log.warning("Discord webhook URL not configured — skipping alert")
             return False
 
+        # Serialize once for both signing and sending
+        payload_bytes = json.dumps(payload, separators=(',', ':')).encode("utf-8")
+        sig_headers = self._sign_payload(payload_bytes)
+        headers = {"Content-Type": "application/json"}
+        headers.update(sig_headers)
+
         for attempt in range(1, max_retries + 1):
             try:
                 response = requests.post(
                     self.webhook_url,
-                    json=payload,
+                    data=payload_bytes,
+                    headers=headers,
                     timeout=10,
                 )
                 if response.status_code in (200, 204):

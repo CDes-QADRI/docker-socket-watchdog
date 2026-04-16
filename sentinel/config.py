@@ -136,6 +136,9 @@ class Config:
         _channel_id = os.getenv("DISCORD_CHANNEL_ID", "")
         self.discord_channel_id = int(_channel_id) if _channel_id.isdigit() else 0
 
+        # Webhook HMAC signing secret (optional — for custom integrations)
+        self.webhook_secret = os.getenv("WEBHOOK_SECRET", "")
+
         self.discord_colors = {
             "critical": discord_cfg.get("color_critical", discord_defaults["color_critical"]),
             "warning": discord_cfg.get("color_warning", discord_defaults["color_warning"]),
