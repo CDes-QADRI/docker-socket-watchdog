@@ -97,6 +97,13 @@ class DiscordAlerter:
         self.footer_icon = config.discord_footer_icon
         self.webhook_secret = config.webhook_secret
 
+        # Persistent HTTP session — reuses TCP connections across alerts.
+        # Prevents connection exhaustion under high alert volume.
+        self._session = requests.Session()
+        self._session.headers.update({
+            "User-Agent": "docker-socket-watchdog/1.0",
+        })
+
     def _sign_payload(self, payload_bytes: bytes) -> dict:
         """
         Generate HMAC-SHA256 signature headers for a JSON payload.
@@ -133,7 +140,7 @@ class DiscordAlerter:
 
         for attempt in range(1, max_retries + 1):
             try:
-                response = requests.post(
+                response = self._session.post(
                     self.webhook_url,
                     data=payload_bytes,
                     headers=headers,
