@@ -110,7 +110,7 @@ class DockerMonitor:
         max_retries = 3
         for attempt in range(1, max_retries + 1):
             try:
-                self.client = docker.from_env()
+                self.client = docker.from_env(timeout=30)
                 self.client.ping()
                 log.info("Connected to Docker daemon")
                 return True
