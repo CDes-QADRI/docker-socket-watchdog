@@ -13,12 +13,73 @@ import hashlib
 import hmac
 import json
 import time
+import threading
 import requests
 from datetime import datetime, timezone
 from sentinel.logger import log
 from sentinel.config import Config
 from sentinel.monitor import ContainerInfo
 from sentinel.sanitizer import sanitize
+
+
+# ─── Alert Rate Limiter ────────────────────────────────────────────────────────
+
+class AlertRateLimiter:
+    """
+    Prevents alert flooding by enforcing per-container cooldowns.
+
+    Two tiers:
+    - Per-container cooldown: max 1 alert per container per 60s
+    - Global burst limit: max 10 alerts total in any 60s window
+    """
+
+    def __init__(self, per_container_cooldown: int = 60, global_burst: int = 10,
+                 global_window: int = 60):
+        self._lock = threading.Lock()
+        self._container_last_alert: dict[str, float] = {}
+        self._global_timestamps: list[float] = []
+        self._per_container_cooldown = per_container_cooldown
+        self._global_burst = global_burst
+        self._global_window = global_window
+
+    def allow(self, container_name: str) -> bool:
+        """Return True if this alert should be sent, False if rate-limited."""
+        now = time.monotonic()
+        with self._lock:
+            # 1. Per-container cooldown
+            last = self._container_last_alert.get(container_name, 0)
+            if now - last < self._per_container_cooldown:
+                return False
+
+            # 2. Global burst limit — prune old timestamps
+            self._global_timestamps = [
+                t for t in self._global_timestamps
+                if now - t < self._global_window
+            ]
+            if len(self._global_timestamps) >= self._global_burst:
+                return False
+
+            # Record this alert
+            self._container_last_alert[container_name] = now
+            self._global_timestamps.append(now)
+            return True
+
+    def allow_always(self) -> bool:
+        """Check global burst limit only (no container scope, e.g. scan summaries)."""
+        now = time.monotonic()
+        with self._lock:
+            self._global_timestamps = [
+                t for t in self._global_timestamps
+                if now - t < self._global_window
+            ]
+            if len(self._global_timestamps) >= self._global_burst:
+                return False
+            self._global_timestamps.append(now)
+            return True
+
+
+# Module-level singleton so both alerter and bot share the same limiter
+rate_limiter = AlertRateLimiter()
 
 
 class DiscordAlerter:
@@ -113,6 +174,10 @@ class DiscordAlerter:
 
     def send_realtime_event(self, event):
         """Send an instant notification for a real-time Docker event."""
+        if not rate_limiter.allow(event.container_name):
+            log.debug(f"Rate-limited alert for '{event.container_name}' — skipping")
+            return False
+
         severity = event.severity
         color = self.colors.get(severity, self.colors['info'])
 
@@ -230,6 +295,9 @@ class DiscordAlerter:
 
     def send_issue_detected(self, container_info: ContainerInfo):
         """Send a beautiful alert when a container issue is detected."""
+        if not rate_limiter.allow(container_info.name):
+            log.debug(f"Rate-limited issue alert for '{container_info.name}' — skipping")
+            return False
 
         severity = container_info.severity
         color = self.colors.get(severity, self.colors["warning"])
@@ -488,6 +556,9 @@ class DiscordAlerter:
 
     def send_resource_alert(self, alert):
         """Send a Discord alert for high CPU/RAM usage before crash."""
+        if not rate_limiter.allow(alert.container_name):
+            log.debug(f"Rate-limited resource alert for '{alert.container_name}' — skipping")
+            return False
 
         severity = alert.severity
         color = self.colors.get(severity, self.colors["warning"])

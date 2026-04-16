@@ -19,6 +19,7 @@ import docker as docker_sdk
 from datetime import datetime, timezone
 from sentinel.logger import log
 from sentinel.sanitizer import sanitize
+from sentinel.alerter import rate_limiter
 
 try:
     import discord
@@ -495,6 +496,10 @@ class SentinelBot(discord.Client):
         Send a crash/issue alert WITH Restart/Skip buttons to Discord.
         Called from the events thread via thread-safe scheduling.
         """
+        if not rate_limiter.allow(event.container_name):
+            log.debug(f"Rate-limited bot alert for '{event.container_name}' — skipping")
+            return
+
         channel = self.get_channel(self.channel_id)
         if not channel:
             try:
@@ -557,6 +562,10 @@ class SentinelBot(discord.Client):
         Send a resource spike alert WITH Restart/Skip buttons to Discord.
         Called from the resource monitor thread via thread-safe scheduling.
         """
+        if not rate_limiter.allow(alert.container_name):
+            log.debug(f"Rate-limited bot resource alert for '{alert.container_name}' — skipping")
+            return
+
         channel = self.get_channel(self.channel_id)
         if not channel:
             try:
@@ -650,6 +659,10 @@ class SentinelBot(discord.Client):
         This replaces the webhook-only alerter.send_issue_detected() when
         the bot is available.
         """
+        if not rate_limiter.allow(container_info.name):
+            log.debug(f"Rate-limited bot issue alert for '{container_info.name}' — skipping")
+            return
+
         channel = self.get_channel(self.channel_id)
         if not channel:
             try:
