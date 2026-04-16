@@ -291,9 +291,9 @@ def main():
         # ═══════════════════════════════════════════════════════════════════
 
         # Queue: events thread puts crash events here → main thread processes
-        # Bounded to 100 items to prevent memory exhaustion under event storms.
+        # Bounded to 1000 items to prevent memory exhaustion under event storms.
         # If full, new events are dropped (Discord alert already sent by that point).
-        event_q = queue.Queue(maxsize=100)
+        event_q = queue.Queue(maxsize=1000)
 
         def on_docker_event(container_event):
             """
