@@ -387,6 +387,8 @@ def main():
 
         # ── Main Loop ──
         last_scan_time = time.time()
+        last_health_check = time.time()
+        _thread_death_alerted = set()  # Track which threads we've already warned about
 
         while not shutdown_requested:
             # Process any queued crash events (from events thread)
@@ -436,6 +438,16 @@ def main():
             except Exception as e:
                 log.error(f"Error during periodic scan: {e}")
                 last_scan_time = time.time()
+
+            # ── Thread Health Check (every 30s) ──
+            if time.time() - last_health_check >= 30:
+                last_health_check = time.time()
+                if not events_thread.is_alive() and "events" not in _thread_death_alerted:
+                    log.critical("Event listener thread DIED — real-time monitoring lost!")
+                    _thread_death_alerted.add("events")
+                if resource_monitor and not resource_thread.is_alive() and "resource" not in _thread_death_alerted:
+                    log.critical("Resource monitor thread DIED — CPU/RAM monitoring lost!")
+                    _thread_death_alerted.add("resource")
 
             # Sleep briefly before next iteration
             time.sleep(0.5)
