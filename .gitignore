@@ -1,5 +1,7 @@
 # Secrets
 .env
+*.pem
+*.key
 
 # Python
 __pycache__/
@@ -11,6 +13,8 @@ dist/
 build/
 venv/
 .venv/
+.pytest_cache/
+.mypy_cache/
 
 # Logs
 logs/
@@ -21,7 +25,17 @@ logs/
 .idea/
 *.swp
 *.swo
+*.sublime-*
 
 # OS
 .DS_Store
 Thumbs.db
+
+# Docker
+*.tar
+docker-compose.override.yml
+
+# Testing
+stress_test.py
+htmlcov/
+.coverage
