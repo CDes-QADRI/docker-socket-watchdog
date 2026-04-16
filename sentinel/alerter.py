@@ -18,6 +18,7 @@ from datetime import datetime, timezone
 from sentinel.logger import log
 from sentinel.config import Config
 from sentinel.monitor import ContainerInfo
+from sentinel.sanitizer import sanitize
 
 
 class DiscordAlerter:
@@ -206,7 +207,7 @@ class DiscordAlerter:
                 },
                 {
                     "name": "⚙️ Configuration",
-                    "value": f"```\n{config_summary}\n```",
+                    "value": f"```\n{sanitize(config_summary)}\n```",
                     "inline": False,
                 },
             ],
@@ -284,7 +285,7 @@ class DiscordAlerter:
         if container_info.error_msg:
             fields.append({
                 "name": "❌ Error Message",
-                "value": f"```\n{container_info.error_msg[:500]}\n```",
+                "value": f"```\n{sanitize(container_info.error_msg[:500])}\n```",
                 "inline": False,
             })
 

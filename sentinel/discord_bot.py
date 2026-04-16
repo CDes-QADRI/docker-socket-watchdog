@@ -18,6 +18,7 @@ import traceback
 import docker as docker_sdk
 from datetime import datetime, timezone
 from sentinel.logger import log
+from sentinel.sanitizer import sanitize
 
 try:
     import discord
@@ -712,7 +713,7 @@ class SentinelBot(discord.Client):
         if container_info.error_msg:
             embed.add_field(
                 name="❌ Error Message",
-                value=f"```\n{container_info.error_msg[:500]}\n```",
+                value=f"```\n{sanitize(container_info.error_msg[:500])}\n```",
                 inline=False,
             )
 
