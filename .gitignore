@@ -39,3 +39,4 @@ docker-compose.override.yml
 stress_test.py
 htmlcov/
 .coverage
+test_sentinel.sh
