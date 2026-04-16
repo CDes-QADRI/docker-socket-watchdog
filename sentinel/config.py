@@ -221,6 +221,39 @@ class Config:
             )
             self.check_interval = 10
 
+        # ── Numeric bounds validation ──
+        self.check_interval = self._clamp("check_interval", self.check_interval, 10, 86400)
+        self.max_restart_attempts = self._clamp("max_restart_attempts", self.max_restart_attempts, 0, 10)
+        self.restart_timeout = self._clamp("restart_timeout", self.restart_timeout, 5, 300)
+        self.resource_check_interval = self._clamp("resource_check_interval", self.resource_check_interval, 5, 3600)
+        self.ram_threshold_percent = self._clamp("ram_threshold_percent", self.ram_threshold_percent, 1, 100)
+        self.cpu_threshold_percent = self._clamp("cpu_threshold_percent", self.cpu_threshold_percent, 1, 500)
+        self.resource_consecutive_breaches = self._clamp("resource_consecutive_breaches", self.resource_consecutive_breaches, 1, 100)
+        self.resource_alert_cooldown = self._clamp("resource_alert_cooldown", self.resource_alert_cooldown, 10, 86400)
+
+        # ── Watch mode validation ──
+        if self.watch_mode not in ("all", "specific"):
+            log.warning(
+                f"Invalid watch_mode '{self.watch_mode}' — defaulting to 'all'"
+            )
+            self.watch_mode = "all"
+
+    @staticmethod
+    def _clamp(name: str, value, minimum, maximum):
+        """Clamp a config value to safe bounds, logging a warning on correction."""
+        try:
+            val = int(value)
+        except (TypeError, ValueError):
+            log.warning(f"Config '{name}' has invalid value '{value}' — using minimum {minimum}")
+            return minimum
+        if val < minimum:
+            log.warning(f"Config '{name}' ({val}) below minimum — clamped to {minimum}")
+            return minimum
+        if val > maximum:
+            log.warning(f"Config '{name}' ({val}) above maximum — clamped to {maximum}")
+            return maximum
+        return val
+
     def summary(self) -> str:
         """Return a human-readable config summary."""
         interval_min = self.check_interval / 60
