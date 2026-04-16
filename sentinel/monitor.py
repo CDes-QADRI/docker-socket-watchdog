@@ -8,6 +8,7 @@ Detects: exited, dead, unhealthy, and OOM-killed containers.
 import docker
 import time
 import threading
+from concurrent.futures import ThreadPoolExecutor, as_completed
 from docker.errors import DockerException
 from datetime import datetime, timezone
 from sentinel.logger import log
@@ -493,62 +494,71 @@ class ResourceMonitor:
         # Track which containers we saw this cycle (to clean stale breach counts)
         seen_names = set()
 
-        for container in watched:
-            name = container.name
-            seen_names.add(name)
-
+        # Fetch stats in parallel — each call takes ~1s sequentially
+        def _fetch_stats(container):
             try:
-                stats = container.stats(stream=False)
+                return container, container.stats(stream=False)
             except Exception as e:
-                log.debug(f"Cannot get stats for '{name}': {e}")
-                continue
+                log.debug(f"Cannot get stats for '{container.name}': {e}")
+                return container, None
 
-            cpu_percent = self._calc_cpu_percent(stats)
-            mem_percent, mem_usage_mb, mem_limit_mb = self._calc_mem(stats)
+        with ThreadPoolExecutor(max_workers=min(len(watched), 20)) as pool:
+            futures = [pool.submit(_fetch_stats, c) for c in watched]
 
-            ram_exceeded = mem_percent >= self.config.ram_threshold_percent
-            cpu_exceeded = cpu_percent >= self.config.cpu_threshold_percent
+            for future in as_completed(futures):
+                container, stats = future.result()
+                if stats is None:
+                    continue
 
-            if ram_exceeded or cpu_exceeded:
-                self._breach_counts[name] = self._breach_counts.get(name, 0) + 1
+                name = container.name
+                seen_names.add(name)
 
-                if self._breach_counts[name] >= self.config.resource_consecutive_breaches:
-                    # Check cooldown
-                    now = time.time()
-                    last_alert = self._last_alert_time.get(name, 0)
-                    if now - last_alert < self.config.resource_alert_cooldown:
-                        continue  # Still in cooldown
+                cpu_percent = self._calc_cpu_percent(stats)
+                mem_percent, mem_usage_mb, mem_limit_mb = self._calc_mem(stats)
 
-                    # Determine alert type
-                    if ram_exceeded and cpu_exceeded:
-                        alert_type = 'both'
-                    elif ram_exceeded:
-                        alert_type = 'ram'
-                    else:
-                        alert_type = 'cpu'
+                ram_exceeded = mem_percent >= self.config.ram_threshold_percent
+                cpu_exceeded = cpu_percent >= self.config.cpu_threshold_percent
 
-                    image = (
-                        str(container.image.tags[0])
-                        if container.image.tags else "unknown"
-                    )
+                if ram_exceeded or cpu_exceeded:
+                    self._breach_counts[name] = self._breach_counts.get(name, 0) + 1
 
-                    alert = ResourceAlert(
-                        container_name=name,
-                        container_id=container.short_id,
-                        image=image,
-                        cpu_percent=cpu_percent,
-                        mem_percent=mem_percent,
-                        mem_usage_mb=mem_usage_mb,
-                        mem_limit_mb=mem_limit_mb,
-                        alert_type=alert_type,
-                    )
-                    alerts.append(alert)
-                    self._last_alert_time[name] = now
-                    # Reset breach count after alerting
-                    self._breach_counts[name] = 0
-            else:
-                # Usage dropped below threshold — reset breach counter
-                self._breach_counts.pop(name, None)
+                    if self._breach_counts[name] >= self.config.resource_consecutive_breaches:
+                        # Check cooldown
+                        now = time.time()
+                        last_alert = self._last_alert_time.get(name, 0)
+                        if now - last_alert < self.config.resource_alert_cooldown:
+                            continue  # Still in cooldown
+
+                        # Determine alert type
+                        if ram_exceeded and cpu_exceeded:
+                            alert_type = 'both'
+                        elif ram_exceeded:
+                            alert_type = 'ram'
+                        else:
+                            alert_type = 'cpu'
+
+                        image = (
+                            str(container.image.tags[0])
+                            if container.image.tags else "unknown"
+                        )
+
+                        alert = ResourceAlert(
+                            container_name=name,
+                            container_id=container.short_id,
+                            image=image,
+                            cpu_percent=cpu_percent,
+                            mem_percent=mem_percent,
+                            mem_usage_mb=mem_usage_mb,
+                            mem_limit_mb=mem_limit_mb,
+                            alert_type=alert_type,
+                        )
+                        alerts.append(alert)
+                        self._last_alert_time[name] = now
+                        # Reset breach count after alerting
+                        self._breach_counts[name] = 0
+                else:
+                    # Usage dropped below threshold — reset breach counter
+                    self._breach_counts.pop(name, None)
 
         # Clean stale entries for containers that no longer exist
         stale = set(self._breach_counts.keys()) - seen_names
