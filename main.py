@@ -301,6 +301,13 @@ def main():
             Sends Discord notification IMMEDIATELY, then queues crash events
             for the main thread to handle confirmation.
             """
+            try:
+                _process_docker_event(container_event)
+            except Exception as e:
+                # Never let a single bad event crash the listener thread
+                log.error(f"Error processing event for '{container_event.container_name}': {e}")
+
+        def _process_docker_event(container_event):
             # Always send instant Discord notification
             # Route through bot when available (buttons for attention events,
             # consistent identity for all events)
@@ -354,16 +361,19 @@ def main():
 
             def on_resource_alert(alert):
                 """Callback when a container exceeds resource thresholds."""
-                log.warning(
-                    f"{alert.emoji} {alert.container_name} → "
-                    f"{alert.description}"
-                )
-                # Send via bot (with buttons) if available, else webhook
-                bot_sent = False
-                if sentinel_bot:
-                    bot_sent = sentinel_bot.send_resource_alert(alert)
-                if not bot_sent:
-                    alerter.send_resource_alert(alert)
+                try:
+                    log.warning(
+                        f"{alert.emoji} {alert.container_name} → "
+                        f"{alert.description}"
+                    )
+                    # Send via bot (with buttons) if available, else webhook
+                    bot_sent = False
+                    if sentinel_bot:
+                        bot_sent = sentinel_bot.send_resource_alert(alert)
+                    if not bot_sent:
+                        alerter.send_resource_alert(alert)
+                except Exception as e:
+                    log.error(f"Error processing resource alert: {e}")
 
             resource_thread = threading.Thread(
                 target=resource_monitor.run_loop,
