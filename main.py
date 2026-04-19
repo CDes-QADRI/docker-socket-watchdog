@@ -268,6 +268,9 @@ def main():
         # Give the bot a moment to connect
         import time as _t
         _t.sleep(3)
+
+        # Send container dashboard to Discord
+        sentinel_bot.send_container_dashboard()
     elif config.discord_bot_token and not is_bot_available():
         log.warning(
             "DISCORD_BOT_TOKEN is set but discord.py is not installed — "
