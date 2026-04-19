@@ -70,7 +70,24 @@ async def _check_authorization(interaction: Interaction, authorized_role_ids: li
     Returns True if authorized, False if denied (sends ephemeral denial message).
     """
     if not authorized_role_ids:
-        return True  # No roles configured = allow everyone
+        # Default deny: require explicit role configuration for security
+        # Server admins bypass this check below
+        if not interaction.user.guild_permissions.administrator:
+            try:
+                await interaction.response.send_message(
+                    "🔒 **Access Denied** — No authorized roles configured.\n"
+                    "A server admin must set `authorized_role_ids` in config.yaml, "
+                    "or use this bot as a server administrator.",
+                    ephemeral=True,
+                )
+            except Exception:
+                pass
+            log.warning(
+                f"🔒 Denied (no roles configured): '{interaction.user.display_name}' "
+                f"(ID: {interaction.user.id})"
+            )
+            return False
+        return True  # Admin bypass when no roles configured
 
     # Server admins always allowed
     if interaction.user.guild_permissions.administrator:
@@ -338,11 +355,34 @@ class CreateContainerModal(Modal):
     async def on_submit(self, interaction: Interaction):
         await interaction.response.defer(ephemeral=False)
 
-        name = sanitize(str(self.container_name).strip())
+        name = str(self.container_name).strip()
         image = str(self.image_name).strip()
         ports_raw = str(self.ports).strip()
         env_raw = str(self.env_vars).strip()
         restart_raw = str(self.restart_policy).strip() or "unless-stopped"
+
+        # Validate container name
+        if not _is_valid_container_name(name):
+            embed = discord.Embed(
+                title="❌ Invalid Container Name",
+                description=(
+                    f"`{sanitize(name[:50])}` is not a valid Docker container name.\n"
+                    "Must start with alphanumeric, contain only `a-z A-Z 0-9 _ . -`, max 128 chars."
+                ),
+                color=COLORS["critical"],
+            )
+            await interaction.followup.send(embed=embed)
+            return
+
+        # Validate image name (basic check — no shell metacharacters)
+        if not re.match(r'^[a-zA-Z0-9][a-zA-Z0-9_./:@-]{0,255}$', image):
+            embed = discord.Embed(
+                title="❌ Invalid Image Name",
+                description="Image name contains invalid characters.",
+                color=COLORS["critical"],
+            )
+            await interaction.followup.send(embed=embed)
+            return
 
         # Parse ports: "8080:80, 3306:3306" -> {"8080/tcp": 80, ...}
         port_bindings = {}
@@ -351,16 +391,43 @@ class CreateContainerModal(Modal):
                 mapping = mapping.strip()
                 if ":" in mapping:
                     parts = mapping.split(":")
-                    host_port = parts[0].strip()
-                    container_port = parts[1].strip()
-                    port_bindings[f"{container_port}/tcp"] = int(host_port)
+                    try:
+                        host_port = int(parts[0].strip())
+                        container_port = int(parts[1].strip())
+                    except (ValueError, IndexError):
+                        embed = discord.Embed(
+                            title="❌ Invalid Port Mapping",
+                            description=f"Invalid port: `{sanitize(mapping[:50])}`. Use format: `host:container` (e.g. `8080:80`)",
+                            color=COLORS["critical"],
+                        )
+                        await interaction.followup.send(embed=embed)
+                        return
+                    if not (1 <= host_port <= 65535 and 1 <= container_port <= 65535):
+                        embed = discord.Embed(
+                            title="❌ Invalid Port Range",
+                            description=f"Ports must be between 1 and 65535. Got: `{mapping.strip()}`",
+                            color=COLORS["critical"],
+                        )
+                        await interaction.followup.send(embed=embed)
+                        return
+                    port_bindings[f"{container_port}/tcp"] = host_port
 
-        # Parse env vars
+        # Parse env vars (block dangerous keys)
+        _BLOCKED_ENV_KEYS = {"LD_PRELOAD", "LD_LIBRARY_PATH", "DYLD_INSERT_LIBRARIES"}
         environment = []
         if env_raw:
             for line in env_raw.splitlines():
                 line = line.strip()
                 if "=" in line:
+                    key = line.split("=", 1)[0].strip().upper()
+                    if key in _BLOCKED_ENV_KEYS:
+                        embed = discord.Embed(
+                            title="❌ Blocked Environment Variable",
+                            description=f"`{key}` is not allowed for security reasons.",
+                            color=COLORS["critical"],
+                        )
+                        await interaction.followup.send(embed=embed)
+                        return
                     environment.append(line)
 
         # Validate restart policy
@@ -410,9 +477,10 @@ class CreateContainerModal(Modal):
             await interaction.followup.send(embed=embed, view=view)
 
         except Exception as e:
+            log.error(f"Container creation failed for '{name}': {e}")
             embed = discord.Embed(
                 title="❌ Container Creation Failed",
-                description=f"```\n{str(e)[:1500]}\n```",
+                description="An error occurred while creating the container. Check server logs for details.",
                 color=COLORS["critical"],
                 timestamp=datetime.now(timezone.utc),
             )
@@ -420,6 +488,43 @@ class CreateContainerModal(Modal):
             embed.add_field(name="🏷️ Image", value=f"`{image}`", inline=True)
             embed.set_footer(text="docker-socket-watchdog", icon_url=DOCKER_THUMBNAIL)
             await interaction.followup.send(embed=embed)
+
+
+# ─── Confirmation View for Destructive Operations ─────────────────────────────
+
+class ConfirmActionView(View):
+    """Two-step confirmation for destructive operations (Stop All, Restart All, Prune)."""
+
+    def __init__(self, action_name, callback_coro):
+        super().__init__(timeout=30)
+        self.action_name = action_name
+        self._callback_coro = callback_coro
+
+        confirm_btn = Button(style=ButtonStyle.danger, label=f"✅ Confirm {action_name}", custom_id="dsw_confirm_yes")
+        confirm_btn.callback = self._confirm
+        self.add_item(confirm_btn)
+
+        cancel_btn = Button(style=ButtonStyle.secondary, label="❌ Cancel", custom_id="dsw_confirm_no")
+        cancel_btn.callback = self._cancel
+        self.add_item(cancel_btn)
+
+    async def _confirm(self, interaction: Interaction):
+        self.stop()
+        await self._callback_coro(interaction)
+
+    async def _cancel(self, interaction: Interaction):
+        self.stop()
+        embed = discord.Embed(
+            title=f"❌ {self.action_name} Cancelled",
+            description="Operation cancelled by user.",
+            color=COLORS["info"],
+            timestamp=datetime.now(timezone.utc),
+        )
+        embed.set_footer(text="docker-socket-watchdog", icon_url=DOCKER_THUMBNAIL)
+        await interaction.response.send_message(embed=embed, ephemeral=True)
+
+    async def on_timeout(self):
+        pass
 
 
 # ─── Dashboard View (Docker Management) ───────────────────────────────────────
@@ -590,7 +695,8 @@ class DashboardView(View):
                     c.start()
                     results.append(f"✅ **{c.name}** — started")
                 except Exception as e:
-                    results.append(f"❌ **{c.name}** — {str(e)[:100]}")
+                    log.error(f"Failed to start {c.name}: {e}")
+                    results.append(f"❌ **{c.name}** — failed (check logs)")
             return results
 
         results = await loop.run_in_executor(None, _start_all)
@@ -614,82 +720,84 @@ class DashboardView(View):
         await interaction.followup.send(embed=embed)
 
     async def stop_all_callback(self, interaction: Interaction):
-        """Stop all running containers."""
+        """Stop all running containers — with confirmation."""
         if not await _check_authorization(interaction, self.authorized_role_ids):
             return
-        await interaction.response.defer(ephemeral=False)
 
-        loop = asyncio.get_running_loop()
+        async def _do_stop_all(confirm_interaction: Interaction):
+            await confirm_interaction.response.defer(ephemeral=False)
+            loop = asyncio.get_running_loop()
 
-        def _stop_all():
-            results = []
-            running = self.docker_client.containers.list(filters={"status": "running"})
-            for c in running:
-                try:
-                    c.stop(timeout=10)
-                    results.append(f"⏹️ **{c.name}** — stopped")
-                except Exception as e:
-                    results.append(f"❌ **{c.name}** — {str(e)[:100]}")
-            return results
+            def _stop_all():
+                results = []
+                running = self.docker_client.containers.list(filters={"status": "running"})
+                for c in running:
+                    try:
+                        c.stop(timeout=10)
+                        results.append(f"⏹️ **{c.name}** — stopped")
+                    except Exception as e:
+                        log.error(f"Failed to stop {c.name}: {e}")
+                        results.append(f"❌ **{c.name}** — failed (check logs)")
+                return results
 
-        results = await loop.run_in_executor(None, _stop_all)
+            results = await loop.run_in_executor(None, _stop_all)
 
-        if not results:
-            embed = discord.Embed(
-                title="ℹ️ No Running Containers",
-                description="All containers are already stopped.",
-                color=COLORS["info"],
-                timestamp=datetime.now(timezone.utc),
-            )
-        else:
-            embed = discord.Embed(
-                title="⏹️ Stop All — Results",
-                description="\n".join(results),
-                color=COLORS["warning"],
-                timestamp=datetime.now(timezone.utc),
-            )
+            if not results:
+                embed = discord.Embed(title="ℹ️ No Running Containers", description="All containers are already stopped.", color=COLORS["info"], timestamp=datetime.now(timezone.utc))
+            else:
+                embed = discord.Embed(title="⏹️ Stop All — Results", description="\n".join(results), color=COLORS["warning"], timestamp=datetime.now(timezone.utc))
+            embed.set_footer(text="docker-socket-watchdog", icon_url=DOCKER_THUMBNAIL)
+            await confirm_interaction.followup.send(embed=embed)
 
-        embed.set_footer(text="docker-socket-watchdog", icon_url=DOCKER_THUMBNAIL)
-        await interaction.followup.send(embed=embed)
+        embed = discord.Embed(
+            title="⚠️ Confirm: Stop All Running Containers?",
+            description="This will stop **all running** containers. Are you sure?",
+            color=COLORS["warning"],
+            timestamp=datetime.now(timezone.utc),
+        )
+        embed.set_footer(text="docker-socket-watchdog • Expires in 30s", icon_url=DOCKER_THUMBNAIL)
+        view = ConfirmActionView("Stop All", _do_stop_all)
+        await interaction.response.send_message(embed=embed, view=view, ephemeral=True)
 
     async def restart_all_callback(self, interaction: Interaction):
-        """Restart all running containers."""
+        """Restart all running containers — with confirmation."""
         if not await _check_authorization(interaction, self.authorized_role_ids):
             return
-        await interaction.response.defer(ephemeral=False)
 
-        loop = asyncio.get_running_loop()
+        async def _do_restart_all(confirm_interaction: Interaction):
+            await confirm_interaction.response.defer(ephemeral=False)
+            loop = asyncio.get_running_loop()
 
-        def _restart_all():
-            results = []
-            running = self.docker_client.containers.list(filters={"status": "running"})
-            for c in running:
-                try:
-                    c.restart(timeout=10)
-                    results.append(f"🔁 **{c.name}** — restarted")
-                except Exception as e:
-                    results.append(f"❌ **{c.name}** — {str(e)[:100]}")
-            return results
+            def _restart_all():
+                results = []
+                running = self.docker_client.containers.list(filters={"status": "running"})
+                for c in running:
+                    try:
+                        c.restart(timeout=10)
+                        results.append(f"🔁 **{c.name}** — restarted")
+                    except Exception as e:
+                        log.error(f"Failed to restart {c.name}: {e}")
+                        results.append(f"❌ **{c.name}** — failed (check logs)")
+                return results
 
-        results = await loop.run_in_executor(None, _restart_all)
+            results = await loop.run_in_executor(None, _restart_all)
 
-        if not results:
-            embed = discord.Embed(
-                title="ℹ️ No Running Containers",
-                description="No running containers to restart.",
-                color=COLORS["info"],
-                timestamp=datetime.now(timezone.utc),
-            )
-        else:
-            embed = discord.Embed(
-                title="🔁 Restart All — Results",
-                description="\n".join(results),
-                color=COLORS["success"],
-                timestamp=datetime.now(timezone.utc),
-            )
+            if not results:
+                embed = discord.Embed(title="ℹ️ No Running Containers", description="No running containers to restart.", color=COLORS["info"], timestamp=datetime.now(timezone.utc))
+            else:
+                embed = discord.Embed(title="🔁 Restart All — Results", description="\n".join(results), color=COLORS["success"], timestamp=datetime.now(timezone.utc))
+            embed.set_footer(text="docker-socket-watchdog", icon_url=DOCKER_THUMBNAIL)
+            await confirm_interaction.followup.send(embed=embed)
 
-        embed.set_footer(text="docker-socket-watchdog", icon_url=DOCKER_THUMBNAIL)
-        await interaction.followup.send(embed=embed)
+        embed = discord.Embed(
+            title="⚠️ Confirm: Restart All Running Containers?",
+            description="This will restart **all running** containers. Are you sure?",
+            color=COLORS["warning"],
+            timestamp=datetime.now(timezone.utc),
+        )
+        embed.set_footer(text="docker-socket-watchdog • Expires in 30s", icon_url=DOCKER_THUMBNAIL)
+        view = ConfirmActionView("Restart All", _do_restart_all)
+        await interaction.response.send_message(embed=embed, view=view, ephemeral=True)
 
     async def list_callback(self, interaction: Interaction):
         """Show detailed container list with per-container action buttons."""
@@ -711,8 +819,10 @@ class DashboardView(View):
             await interaction.followup.send(embed=embed)
             return
 
-        # Send per-container cards — 1 container per message with full management view
-        for i, c in enumerate(containers):
+        # Send per-container cards — max 10 containers, then summary
+        MAX_CARDS = 10
+        display_containers = containers[:MAX_CARDS]
+        for i, c in enumerate(display_containers):
             status_emoji = "🟢" if c["status"] == "running" else "🔴"
             health_str = f" ({c['health']})" if c.get("health") and c["health"] != "N/A" else ""
             embed = discord.Embed(
@@ -727,6 +837,20 @@ class DashboardView(View):
 
             view = ContainerManageView(c["name"], self.docker_client, self.config)
             await interaction.followup.send(embed=embed, view=view)
+
+        if len(containers) > MAX_CARDS:
+            remaining = len(containers) - MAX_CARDS
+            names = ", ".join(c["name"] for c in containers[MAX_CARDS:MAX_CARDS+20])
+            if len(containers) > MAX_CARDS + 20:
+                names += f", ... and {len(containers) - MAX_CARDS - 20} more"
+            embed = discord.Embed(
+                title=f"📋 +{remaining} More Containers",
+                description=f"Use **Refresh** to see updated status.\n\n{names}",
+                color=COLORS["info"],
+                timestamp=datetime.now(timezone.utc),
+            )
+            embed.set_footer(text="docker-socket-watchdog", icon_url=DOCKER_THUMBNAIL)
+            await interaction.followup.send(embed=embed)
 
     async def add_container_callback(self, interaction: Interaction):
         """Open modal to create a new container."""
@@ -956,63 +1080,67 @@ class DockerSystemView(View):
     async def prune_callback(self, interaction: Interaction):
         if not await _check_authorization(interaction, self.authorized_role_ids):
             return
-        await interaction.response.defer(ephemeral=False)
 
-        log.warning(f"🧹 User '{interaction.user.display_name}' initiated system prune!")
+        async def _do_prune(confirm_interaction: Interaction):
+            await confirm_interaction.response.defer(ephemeral=False)
+            log.warning(f"🧹 User '{confirm_interaction.user.display_name}' confirmed system prune!")
+            loop = asyncio.get_running_loop()
 
-        loop = asyncio.get_running_loop()
+            def _prune():
+                results = {}
+                c_result = self.docker_client.containers.prune()
+                results["containers"] = len(c_result.get("ContainersDeleted") or [])
+                results["containers_space"] = c_result.get("SpaceReclaimed", 0)
+                i_result = self.docker_client.images.prune(filters={"dangling": True})
+                results["images"] = len(i_result.get("ImagesDeleted") or [])
+                results["images_space"] = i_result.get("SpaceReclaimed", 0)
+                v_result = self.docker_client.volumes.prune()
+                results["volumes"] = len(v_result.get("VolumesDeleted") or [])
+                results["volumes_space"] = v_result.get("SpaceReclaimed", 0)
+                n_result = self.docker_client.networks.prune()
+                results["networks"] = len(n_result.get("NetworksDeleted") or [])
+                return results
 
-        def _prune():
-            results = {}
-            # Prune stopped containers
-            c_result = self.docker_client.containers.prune()
-            results["containers"] = len(c_result.get("ContainersDeleted") or [])
-            results["containers_space"] = c_result.get("SpaceReclaimed", 0)
+            try:
+                results = await loop.run_in_executor(None, _prune)
+                total_reclaimed = results["containers_space"] + results["images_space"] + results["volumes_space"]
+                embed = discord.Embed(
+                    title="🧹 System Prune Complete",
+                    description=f"**Total space reclaimed:** `{total_reclaimed / (1024**2):.1f}MB`",
+                    color=COLORS["success"],
+                    timestamp=datetime.now(timezone.utc),
+                )
+                embed.add_field(name="📦 Containers", value=f"`{results['containers']}` removed", inline=True)
+                embed.add_field(name="🖼️ Images", value=f"`{results['images']}` removed", inline=True)
+                embed.add_field(name="💾 Volumes", value=f"`{results['volumes']}` removed", inline=True)
+                embed.add_field(name="🌐 Networks", value=f"`{results['networks']}` removed", inline=True)
+            except Exception as e:
+                embed = discord.Embed(
+                    title="❌ Prune Failed",
+                    description="An error occurred during system prune. Check server logs.",
+                    color=COLORS["critical"],
+                    timestamp=datetime.now(timezone.utc),
+                )
+                log.error(f"System prune failed: {e}")
+            embed.set_footer(text="docker-socket-watchdog", icon_url=DOCKER_THUMBNAIL)
+            await confirm_interaction.followup.send(embed=embed)
 
-            # Prune dangling images
-            i_result = self.docker_client.images.prune(filters={"dangling": True})
-            results["images"] = len(i_result.get("ImagesDeleted") or [])
-            results["images_space"] = i_result.get("SpaceReclaimed", 0)
-
-            # Prune unused volumes
-            v_result = self.docker_client.volumes.prune()
-            results["volumes"] = len(v_result.get("VolumesDeleted") or [])
-            results["volumes_space"] = v_result.get("SpaceReclaimed", 0)
-
-            # Prune unused networks
-            n_result = self.docker_client.networks.prune()
-            results["networks"] = len(n_result.get("NetworksDeleted") or [])
-
-            return results
-
-        try:
-            results = await loop.run_in_executor(None, _prune)
-
-            total_reclaimed = (
-                results["containers_space"] + results["images_space"] + results["volumes_space"]
-            )
-
-            embed = discord.Embed(
-                title="🧹 System Prune Complete",
-                description=f"**Total space reclaimed:** `{total_reclaimed / (1024**2):.1f}MB`",
-                color=COLORS["success"],
-                timestamp=datetime.now(timezone.utc),
-            )
-            embed.add_field(name="📦 Containers", value=f"`{results['containers']}` removed", inline=True)
-            embed.add_field(name="🖼️ Images", value=f"`{results['images']}` removed", inline=True)
-            embed.add_field(name="💾 Volumes", value=f"`{results['volumes']}` removed", inline=True)
-            embed.add_field(name="🌐 Networks", value=f"`{results['networks']}` removed", inline=True)
-        except Exception as e:
-            embed = discord.Embed(
-                title="❌ Prune Failed",
-                description=f"Error: `{str(e)[:200]}`",
-                color=COLORS["critical"],
-                timestamp=datetime.now(timezone.utc),
-            )
-            log.error(f"System prune failed: {e}")
-
-        embed.set_footer(text="docker-socket-watchdog", icon_url=DOCKER_THUMBNAIL)
-        await interaction.followup.send(embed=embed)
+        embed = discord.Embed(
+            title="⚠️ Confirm: System Prune?",
+            description=(
+                "This will **permanently delete**:\n"
+                "• All stopped containers\n"
+                "• All dangling images\n"
+                "• All unused volumes (⚠️ data loss!)\n"
+                "• All unused networks\n\n"
+                "**This action cannot be undone.** Are you sure?"
+            ),
+            color=COLORS["critical"],
+            timestamp=datetime.now(timezone.utc),
+        )
+        embed.set_footer(text="docker-socket-watchdog • Expires in 30s", icon_url=DOCKER_THUMBNAIL)
+        view = ConfirmActionView("Prune", _do_prune)
+        await interaction.response.send_message(embed=embed, view=view, ephemeral=True)
 
 
 # ─── Per-Container Management View ─────────────────────────────────────────────
@@ -1162,7 +1290,7 @@ class ContainerManageView(View):
     async def _logs(self, interaction: Interaction):
         if not await _check_authorization(interaction, self.authorized_role_ids):
             return
-        await interaction.response.defer(ephemeral=False)
+        await interaction.response.defer(ephemeral=True)
         name = self.container_name
         loop = asyncio.get_running_loop()
         try:

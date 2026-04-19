@@ -339,6 +339,7 @@ class DockerEventListener:
         self.config = config
         self.client = client
         self._stop_event = threading.Event()
+        self._reconnect_backoff = 5
 
     def listen(self, callback):
         """
@@ -349,6 +350,7 @@ class DockerEventListener:
         while not self._stop_event.is_set():
             try:
                 log.info("🔌 Real-time event listener connected")
+                self._reconnect_backoff = 5  # Reset on successful connection
                 events = self.client.events(
                     decode=True, filters={'type': 'container'}
                 )
@@ -377,11 +379,13 @@ class DockerEventListener:
 
             except Exception as e:
                 if not self._stop_event.is_set():
+                    backoff = min(self._reconnect_backoff, 300)
                     log.warning(
                         f"Event listener disconnected: {e}. "
-                        f"Reconnecting in 5s..."
+                        f"Reconnecting in {backoff}s..."
                     )
-                    time.sleep(5)
+                    time.sleep(backoff)
+                    self._reconnect_backoff = min(backoff * 2, 300)
 
     def _should_watch(self, name: str) -> bool:
         """Check if this container should be monitored."""

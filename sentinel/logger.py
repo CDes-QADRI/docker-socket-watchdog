@@ -105,6 +105,7 @@ def setup_logger(name: str = "sentinel", log_level: str = "INFO") -> logging.Log
     # ── Console Handler ──
     console_handler = logging.StreamHandler(sys.stdout)
     console_handler.setFormatter(SentinelConsoleFormatter())
+    console_handler.addFilter(SanitizeFilter())
     logger.addHandler(console_handler)
 
     # ── File Handler (Rotating — prevents disk exhaustion) ──
