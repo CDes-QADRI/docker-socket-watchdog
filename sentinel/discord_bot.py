@@ -592,6 +592,271 @@ class DashboardView(View):
             await interaction.followup.send(embed=embed, view=view)
 
 
+# ─── Docker System Commands View ───────────────────────────────────────────────
+
+class DockerSystemView(View):
+    """Docker system management buttons: Images, Volumes, Networks, Prune, Pull."""
+
+    def __init__(self, docker_client, config=None):
+        super().__init__(timeout=None)
+        self.docker_client = docker_client
+        self.config = config
+        self.authorized_role_ids = set()
+        if config and hasattr(config, "authorized_role_ids"):
+            self.authorized_role_ids = config.authorized_role_ids
+
+        # Row 1 — Read-only info
+        self.add_item(Button(style=ButtonStyle.primary, label="🖼️ Images", custom_id="dsw_sys_images"))
+        self.add_item(Button(style=ButtonStyle.primary, label="💾 Volumes", custom_id="dsw_sys_volumes"))
+        self.add_item(Button(style=ButtonStyle.primary, label="🌐 Networks", custom_id="dsw_sys_networks"))
+        self.add_item(Button(style=ButtonStyle.primary, label="📈 Docker Stats", custom_id="dsw_sys_stats"))
+        # Row 2 — Dangerous actions
+        self.add_item(Button(style=ButtonStyle.danger, label="🧹 System Prune", custom_id="dsw_sys_prune"))
+
+    async def images_callback(self, interaction: Interaction):
+        if not await _check_authorization(interaction, self.authorized_role_ids):
+            return
+        await interaction.response.defer(ephemeral=False)
+
+        loop = asyncio.get_running_loop()
+
+        def _get_images():
+            images = self.docker_client.images.list()
+            result = []
+            for img in images[:25]:  # Limit to 25
+                tags = img.tags[0] if img.tags else "<none>"
+                size_mb = img.attrs.get("Size", 0) / (1024 * 1024)
+                result.append({"tag": tags, "id": img.short_id.replace("sha256:", ""), "size": f"{size_mb:.1f}MB"})
+            return result
+
+        images = await loop.run_in_executor(None, _get_images)
+
+        embed = discord.Embed(
+            title=f"🖼️ Docker Images ({len(images)})",
+            color=COLORS["info"],
+            timestamp=datetime.now(timezone.utc),
+        )
+        embed.set_thumbnail(url=DOCKER_THUMBNAIL)
+
+        if images:
+            lines = [f"`{img['id']}` — **{img['tag']}** ({img['size']})" for img in images]
+            text = "\n".join(lines)
+            if len(text) <= 4000:
+                embed.description = text
+            else:
+                embed.description = text[:4000] + "\n*...truncated*"
+        else:
+            embed.description = "No images found."
+
+        embed.set_footer(text="docker-socket-watchdog", icon_url=DOCKER_THUMBNAIL)
+        await interaction.followup.send(embed=embed)
+
+    async def volumes_callback(self, interaction: Interaction):
+        if not await _check_authorization(interaction, self.authorized_role_ids):
+            return
+        await interaction.response.defer(ephemeral=False)
+
+        loop = asyncio.get_running_loop()
+
+        def _get_volumes():
+            volumes = self.docker_client.volumes.list()
+            result = []
+            for v in volumes[:25]:
+                driver = v.attrs.get("Driver", "local")
+                name = v.name
+                if len(name) > 40:
+                    name = name[:37] + "..."
+                result.append({"name": name, "driver": driver})
+            return result
+
+        volumes = await loop.run_in_executor(None, _get_volumes)
+
+        embed = discord.Embed(
+            title=f"💾 Docker Volumes ({len(volumes)})",
+            color=COLORS["info"],
+            timestamp=datetime.now(timezone.utc),
+        )
+        embed.set_thumbnail(url=DOCKER_THUMBNAIL)
+
+        if volumes:
+            lines = [f"📁 **{v['name']}** — `{v['driver']}`" for v in volumes]
+            embed.description = "\n".join(lines)
+        else:
+            embed.description = "No volumes found."
+
+        embed.set_footer(text="docker-socket-watchdog", icon_url=DOCKER_THUMBNAIL)
+        await interaction.followup.send(embed=embed)
+
+    async def networks_callback(self, interaction: Interaction):
+        if not await _check_authorization(interaction, self.authorized_role_ids):
+            return
+        await interaction.response.defer(ephemeral=False)
+
+        loop = asyncio.get_running_loop()
+
+        def _get_networks():
+            networks = self.docker_client.networks.list()
+            result = []
+            for n in networks[:25]:
+                driver = n.attrs.get("Driver", "unknown")
+                scope = n.attrs.get("Scope", "local")
+                containers = len(n.attrs.get("Containers", {}) or {})
+                result.append({"name": n.name, "driver": driver, "scope": scope, "containers": containers})
+            return result
+
+        networks = await loop.run_in_executor(None, _get_networks)
+
+        embed = discord.Embed(
+            title=f"🌐 Docker Networks ({len(networks)})",
+            color=COLORS["info"],
+            timestamp=datetime.now(timezone.utc),
+        )
+        embed.set_thumbnail(url=DOCKER_THUMBNAIL)
+
+        if networks:
+            lines = [
+                f"🔗 **{n['name']}** — `{n['driver']}` / `{n['scope']}` ({n['containers']} containers)"
+                for n in networks
+            ]
+            embed.description = "\n".join(lines)
+        else:
+            embed.description = "No networks found."
+
+        embed.set_footer(text="docker-socket-watchdog", icon_url=DOCKER_THUMBNAIL)
+        await interaction.followup.send(embed=embed)
+
+    async def stats_callback(self, interaction: Interaction):
+        if not await _check_authorization(interaction, self.authorized_role_ids):
+            return
+        await interaction.response.defer(ephemeral=False)
+
+        loop = asyncio.get_running_loop()
+
+        def _get_stats():
+            info = self.docker_client.info()
+            df = self.docker_client.df()
+            return info, df
+
+        info, df = await loop.run_in_executor(None, _get_stats)
+
+        embed = discord.Embed(
+            title="📈 Docker System Stats",
+            color=COLORS["info"],
+            timestamp=datetime.now(timezone.utc),
+        )
+        embed.set_thumbnail(url=DOCKER_THUMBNAIL)
+
+        # System info
+        embed.add_field(
+            name="🖥️ System",
+            value=(
+                f"**OS:** `{info.get('OperatingSystem', 'N/A')}`\n"
+                f"**Kernel:** `{info.get('KernelVersion', 'N/A')}`\n"
+                f"**Docker:** `{info.get('ServerVersion', 'N/A')}`\n"
+                f"**CPUs:** `{info.get('NCPU', 'N/A')}`\n"
+                f"**Memory:** `{info.get('MemTotal', 0) // (1024**3)}GB`"
+            ),
+            inline=True,
+        )
+
+        # Container counts
+        embed.add_field(
+            name="📦 Containers",
+            value=(
+                f"**Total:** `{info.get('Containers', 0)}`\n"
+                f"**Running:** `{info.get('ContainersRunning', 0)}`\n"
+                f"**Stopped:** `{info.get('ContainersStopped', 0)}`\n"
+                f"**Paused:** `{info.get('ContainersPaused', 0)}`"
+            ),
+            inline=True,
+        )
+
+        # Images
+        embed.add_field(
+            name="🖼️ Images",
+            value=f"**Total:** `{info.get('Images', 0)}`",
+            inline=True,
+        )
+
+        # Disk usage from df
+        containers_size = sum(c.get("SizeRw", 0) for c in (df.get("Containers") or []))
+        images_size = sum(i.get("Size", 0) for i in (df.get("Images") or []))
+        volumes_size = sum(v.get("UsageData", {}).get("Size", 0) for v in (df.get("Volumes") or []))
+        embed.add_field(
+            name="💿 Disk Usage",
+            value=(
+                f"**Containers:** `{containers_size / (1024**2):.1f}MB`\n"
+                f"**Images:** `{images_size / (1024**2):.1f}MB`\n"
+                f"**Volumes:** `{volumes_size / (1024**2):.1f}MB`"
+            ),
+            inline=False,
+        )
+
+        embed.set_footer(text="docker-socket-watchdog", icon_url=DOCKER_THUMBNAIL)
+        await interaction.followup.send(embed=embed)
+
+    async def prune_callback(self, interaction: Interaction):
+        if not await _check_authorization(interaction, self.authorized_role_ids):
+            return
+        await interaction.response.defer(ephemeral=False)
+
+        log.warning(f"🧹 User '{interaction.user.display_name}' initiated system prune!")
+
+        loop = asyncio.get_running_loop()
+
+        def _prune():
+            results = {}
+            # Prune stopped containers
+            c_result = self.docker_client.containers.prune()
+            results["containers"] = len(c_result.get("ContainersDeleted") or [])
+            results["containers_space"] = c_result.get("SpaceReclaimed", 0)
+
+            # Prune dangling images
+            i_result = self.docker_client.images.prune(filters={"dangling": True})
+            results["images"] = len(i_result.get("ImagesDeleted") or [])
+            results["images_space"] = i_result.get("SpaceReclaimed", 0)
+
+            # Prune unused volumes
+            v_result = self.docker_client.volumes.prune()
+            results["volumes"] = len(v_result.get("VolumesDeleted") or [])
+            results["volumes_space"] = v_result.get("SpaceReclaimed", 0)
+
+            # Prune unused networks
+            n_result = self.docker_client.networks.prune()
+            results["networks"] = len(n_result.get("NetworksDeleted") or [])
+
+            return results
+
+        try:
+            results = await loop.run_in_executor(None, _prune)
+
+            total_reclaimed = (
+                results["containers_space"] + results["images_space"] + results["volumes_space"]
+            )
+
+            embed = discord.Embed(
+                title="🧹 System Prune Complete",
+                description=f"**Total space reclaimed:** `{total_reclaimed / (1024**2):.1f}MB`",
+                color=COLORS["success"],
+                timestamp=datetime.now(timezone.utc),
+            )
+            embed.add_field(name="📦 Containers", value=f"`{results['containers']}` removed", inline=True)
+            embed.add_field(name="🖼️ Images", value=f"`{results['images']}` removed", inline=True)
+            embed.add_field(name="💾 Volumes", value=f"`{results['volumes']}` removed", inline=True)
+            embed.add_field(name="🌐 Networks", value=f"`{results['networks']}` removed", inline=True)
+        except Exception as e:
+            embed = discord.Embed(
+                title="❌ Prune Failed",
+                description=f"Error: `{str(e)[:200]}`",
+                color=COLORS["critical"],
+                timestamp=datetime.now(timezone.utc),
+            )
+            log.error(f"System prune failed: {e}")
+
+        embed.set_footer(text="docker-socket-watchdog", icon_url=DOCKER_THUMBNAIL)
+        await interaction.followup.send(embed=embed)
+
+
 # ─── Per-Container Management View ─────────────────────────────────────────────
 
 class ContainerManageView(View):
@@ -788,6 +1053,19 @@ class SentinelBot(discord.Client):
                 "stop_all": dashboard_view.stop_all_callback,
                 "restart_all": dashboard_view.restart_all_callback,
                 "list": dashboard_view.list_callback,
+            }.get(action)
+            if handler:
+                await handler(interaction)
+        elif custom_id.startswith("dsw_sys_"):
+            # Docker system command buttons
+            sys_view = DockerSystemView(self.docker_client, self.config)
+            action = custom_id[len("dsw_sys_"):]
+            handler = {
+                "images": sys_view.images_callback,
+                "volumes": sys_view.volumes_callback,
+                "networks": sys_view.networks_callback,
+                "stats": sys_view.stats_callback,
+                "prune": sys_view.prune_callback,
             }.get(action)
             if handler:
                 await handler(interaction)
@@ -1622,6 +1900,17 @@ class SentinelBot(discord.Client):
         # Create dashboard action buttons
         view = DashboardView(self.docker_client, self.config)
         await channel.send(embed=embed, view=view)
+
+        # Send Docker System Commands panel
+        sys_embed = discord.Embed(
+            title="⚙️ Docker System Commands",
+            description="Manage Docker images, volumes, networks, and system resources — all from Discord.",
+            color=COLORS["info"],
+            timestamp=datetime.now(timezone.utc),
+        )
+        sys_embed.set_footer(text="docker-socket-watchdog • System Panel", icon_url=DOCKER_THUMBNAIL)
+        sys_view = DockerSystemView(self.docker_client, self.config)
+        await channel.send(embed=sys_embed, view=sys_view)
 
     def send_container_dashboard(self):
         """Thread-safe method to send container dashboard. Called from main thread."""
