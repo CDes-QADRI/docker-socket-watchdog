@@ -563,44 +563,21 @@ class DashboardView(View):
             await interaction.followup.send(embed=embed)
             return
 
-        # Send per-container cards — 2 containers per message (up to 10 buttons)
-        for i in range(0, len(containers), 2):
-            batch = containers[i:i+2]
+        # Send per-container cards — 1 container per message with full management view
+        for i, c in enumerate(containers):
+            status_emoji = "🟢" if c["status"] == "running" else "🔴"
+            health_str = f" ({c['health']})" if c.get("health") and c["health"] != "N/A" else ""
             embed = discord.Embed(
-                title=f"📋 Containers ({i+1}–{min(i+2, len(containers))} of {len(containers)})",
-                color=COLORS["info"],
+                title=f"{status_emoji} {c['name']}{health_str} ({i+1}/{len(containers)})",
+                color=COLORS["success"] if c["status"] == "running" else COLORS["warning"],
                 timestamp=datetime.now(timezone.utc),
             )
-            embed.set_thumbnail(url=DOCKER_THUMBNAIL)
-
-            view = View(timeout=None)
-            for c in batch:
-                status_emoji = "🟢" if c["status"] == "running" else "🔴"
-                health_str = f" ({c['health']})" if c.get("health") and c["health"] != "N/A" else ""
-                embed.add_field(
-                    name=f"{status_emoji} {c['name']}{health_str}",
-                    value=(
-                        f"**Status:** `{c['status']}`\n"
-                        f"**Image:** `{c['image']}`\n"
-                        f"**ID:** `{c['id']}`"
-                    ),
-                    inline=True,
-                )
-
-                name = c["name"]
-                short = name[:15]
-
-                # Row of buttons per container
-                if c["status"] == "running":
-                    view.add_item(Button(style=ButtonStyle.danger, label=f"⏹ {short}", custom_id=f"dsw_stop_{name}"))
-                    view.add_item(Button(style=ButtonStyle.success, label=f"🔄 {short}", custom_id=f"dsw_restart_{name}"))
-                else:
-                    view.add_item(Button(style=ButtonStyle.success, label=f"▶ {short}", custom_id=f"dsw_start_{name}"))
-
-                view.add_item(Button(style=ButtonStyle.primary, label=f"📜 {short}", custom_id=f"dsw_logs_{name}"))
-                view.add_item(Button(style=ButtonStyle.secondary, label=f"🔍 {short}", custom_id=f"dsw_inspect_{name}"))
-
+            embed.add_field(name="📊 Status", value=f"`{c['status']}`", inline=True)
+            embed.add_field(name="🏷️ Image", value=f"`{c['image']}`", inline=True)
+            embed.add_field(name="🆔 ID", value=f"`{c['id']}`", inline=True)
             embed.set_footer(text="docker-socket-watchdog", icon_url=DOCKER_THUMBNAIL)
+
+            view = ContainerManageView(c["name"], self.docker_client, self.config)
             await interaction.followup.send(embed=embed, view=view)
 
 
@@ -618,12 +595,26 @@ class DockerSystemView(View):
             self.authorized_role_ids = config.authorized_role_ids
 
         # Row 1 — Read-only info
-        self.add_item(Button(style=ButtonStyle.primary, label="🖼️ Images", custom_id="dsw_sys_images"))
-        self.add_item(Button(style=ButtonStyle.primary, label="💾 Volumes", custom_id="dsw_sys_volumes"))
-        self.add_item(Button(style=ButtonStyle.primary, label="🌐 Networks", custom_id="dsw_sys_networks"))
-        self.add_item(Button(style=ButtonStyle.primary, label="📈 Docker Stats", custom_id="dsw_sys_stats"))
+        images_btn = Button(style=ButtonStyle.primary, label="🖼️ Images", custom_id="dsw_sys_images")
+        images_btn.callback = self.images_callback
+        self.add_item(images_btn)
+
+        volumes_btn = Button(style=ButtonStyle.primary, label="💾 Volumes", custom_id="dsw_sys_volumes")
+        volumes_btn.callback = self.volumes_callback
+        self.add_item(volumes_btn)
+
+        networks_btn = Button(style=ButtonStyle.primary, label="🌐 Networks", custom_id="dsw_sys_networks")
+        networks_btn.callback = self.networks_callback
+        self.add_item(networks_btn)
+
+        stats_btn = Button(style=ButtonStyle.primary, label="📈 Docker Stats", custom_id="dsw_sys_stats")
+        stats_btn.callback = self.stats_callback
+        self.add_item(stats_btn)
+
         # Row 2 — Dangerous actions
-        self.add_item(Button(style=ButtonStyle.danger, label="🧹 System Prune", custom_id="dsw_sys_prune"))
+        prune_btn = Button(style=ButtonStyle.danger, label="🧹 System Prune", custom_id="dsw_sys_prune")
+        prune_btn.callback = self.prune_callback
+        self.add_item(prune_btn)
 
     async def images_callback(self, interaction: Interaction):
         if not await _check_authorization(interaction, self.authorized_role_ids):
@@ -872,20 +863,25 @@ class DockerSystemView(View):
 # ─── Per-Container Management View ─────────────────────────────────────────────
 
 class ContainerManageView(View):
-    """Per-container action buttons: Start/Stop, Restart, Logs, Inspect."""
+    """Per-container action buttons: Start/Stop, Restart, Logs, Inspect.
+    
+    Each button has a proper callback for current-session clicks.
+    on_interaction handles clicks from previous sessions.
+    """
 
     def __init__(self, container_name, docker_client, config=None):
         super().__init__(timeout=None)
         self.container_name = container_name
         self.docker_client = docker_client
         self.config = config
+        self.authorized_role_ids = config.authorized_role_ids if config else []
 
-        # Add all management buttons
         restart_btn = Button(
             style=ButtonStyle.success,
             label="🔄 Restart",
             custom_id=f"dsw_restart_{container_name}",
         )
+        restart_btn.callback = self._restart
         self.add_item(restart_btn)
 
         stop_btn = Button(
@@ -893,6 +889,7 @@ class ContainerManageView(View):
             label="⏹️ Stop",
             custom_id=f"dsw_stop_{container_name}",
         )
+        stop_btn.callback = self._stop
         self.add_item(stop_btn)
 
         start_btn = Button(
@@ -900,6 +897,7 @@ class ContainerManageView(View):
             label="▶️ Start",
             custom_id=f"dsw_start_{container_name}",
         )
+        start_btn.callback = self._start
         self.add_item(start_btn)
 
         logs_btn = Button(
@@ -907,6 +905,7 @@ class ContainerManageView(View):
             label="📜 Logs",
             custom_id=f"dsw_logs_{container_name}",
         )
+        logs_btn.callback = self._logs
         self.add_item(logs_btn)
 
         inspect_btn = Button(
@@ -914,7 +913,184 @@ class ContainerManageView(View):
             label="🔍 Inspect",
             custom_id=f"dsw_inspect_{container_name}",
         )
+        inspect_btn.callback = self._inspect
         self.add_item(inspect_btn)
+
+    async def _restart(self, interaction: Interaction):
+        if not await _check_authorization(interaction, self.authorized_role_ids):
+            return
+        await interaction.response.defer(ephemeral=False)
+        user = interaction.user
+        name = self.container_name
+        loop = asyncio.get_running_loop()
+        try:
+            def _do():
+                c = self.docker_client.containers.get(name)
+                c.restart(timeout=30)
+                c.reload()
+                return c.status
+            status = await loop.run_in_executor(None, _do)
+            embed = discord.Embed(
+                title="✅ Container Restarted",
+                description=f"**{name}** restarted by **{user.display_name}**",
+                color=COLORS["success"] if status == "running" else COLORS["warning"],
+                timestamp=datetime.now(timezone.utc),
+            )
+            embed.add_field(name="📦 Container", value=f"`{name}`", inline=True)
+            embed.add_field(name="🔄 Status", value=f"{'🟢' if status == 'running' else '🔴'} {status.title()}", inline=True)
+        except docker_sdk.errors.NotFound:
+            embed = discord.Embed(title="❌ Container Not Found", description=f"**{name}** no longer exists.", color=COLORS["critical"], timestamp=datetime.now(timezone.utc))
+        except Exception as e:
+            embed = discord.Embed(title="❌ Restart Failed", description=f"Failed to restart **{name}**.", color=COLORS["critical"], timestamp=datetime.now(timezone.utc))
+            log.error(f"Error restarting '{name}' via button: {e}")
+        embed.set_footer(text="docker-socket-watchdog", icon_url=DOCKER_THUMBNAIL)
+        await interaction.followup.send(embed=embed)
+
+    async def _stop(self, interaction: Interaction):
+        if not await _check_authorization(interaction, self.authorized_role_ids):
+            return
+        await interaction.response.defer(ephemeral=False)
+        name = self.container_name
+        loop = asyncio.get_running_loop()
+        try:
+            def _do():
+                c = self.docker_client.containers.get(name)
+                c.stop(timeout=10)
+                c.reload()
+                return c.status
+            status = await loop.run_in_executor(None, _do)
+            embed = discord.Embed(
+                title="⏹️ Container Stopped",
+                description=f"**{name}** stopped by **{interaction.user.display_name}**",
+                color=COLORS["warning"],
+                timestamp=datetime.now(timezone.utc),
+            )
+            embed.add_field(name="📦 Container", value=f"`{name}`", inline=True)
+            embed.add_field(name="🔄 Status", value=f"🔴 {status.title()}", inline=True)
+        except docker_sdk.errors.NotFound:
+            embed = discord.Embed(title="❌ Container Not Found", description=f"**{name}** no longer exists.", color=COLORS["critical"], timestamp=datetime.now(timezone.utc))
+        except Exception as e:
+            embed = discord.Embed(title="❌ Stop Failed", description=f"Failed to stop **{name}**.", color=COLORS["critical"], timestamp=datetime.now(timezone.utc))
+            log.error(f"Error stopping '{name}' via button: {e}")
+        embed.set_footer(text="docker-socket-watchdog", icon_url=DOCKER_THUMBNAIL)
+        await interaction.followup.send(embed=embed)
+
+    async def _start(self, interaction: Interaction):
+        if not await _check_authorization(interaction, self.authorized_role_ids):
+            return
+        await interaction.response.defer(ephemeral=False)
+        name = self.container_name
+        loop = asyncio.get_running_loop()
+        try:
+            def _do():
+                c = self.docker_client.containers.get(name)
+                c.start()
+                c.reload()
+                return c.status
+            status = await loop.run_in_executor(None, _do)
+            embed = discord.Embed(
+                title="▶️ Container Started",
+                description=f"**{name}** started by **{interaction.user.display_name}**",
+                color=COLORS["success"] if status == "running" else COLORS["warning"],
+                timestamp=datetime.now(timezone.utc),
+            )
+            embed.add_field(name="📦 Container", value=f"`{name}`", inline=True)
+            embed.add_field(name="🔄 Status", value=f"{'🟢' if status == 'running' else '🔴'} {status.title()}", inline=True)
+        except docker_sdk.errors.NotFound:
+            embed = discord.Embed(title="❌ Container Not Found", description=f"**{name}** no longer exists.", color=COLORS["critical"], timestamp=datetime.now(timezone.utc))
+        except Exception as e:
+            embed = discord.Embed(title="❌ Start Failed", description=f"Failed to start **{name}**.", color=COLORS["critical"], timestamp=datetime.now(timezone.utc))
+            log.error(f"Error starting '{name}' via button: {e}")
+        embed.set_footer(text="docker-socket-watchdog", icon_url=DOCKER_THUMBNAIL)
+        await interaction.followup.send(embed=embed)
+
+    async def _logs(self, interaction: Interaction):
+        if not await _check_authorization(interaction, self.authorized_role_ids):
+            return
+        await interaction.response.defer(ephemeral=False)
+        name = self.container_name
+        loop = asyncio.get_running_loop()
+        try:
+            def _do():
+                c = self.docker_client.containers.get(name)
+                return c.logs(tail=30, timestamps=True).decode("utf-8", errors="replace")
+            logs_text = await loop.run_in_executor(None, _do)
+            if len(logs_text) > 4000:
+                logs_text = logs_text[-4000:]
+            embed = discord.Embed(
+                title=f"📜 Logs — {name}",
+                description=f"```\n{sanitize(logs_text) if logs_text.strip() else '(empty)'}\n```",
+                color=COLORS["info"],
+                timestamp=datetime.now(timezone.utc),
+            )
+        except docker_sdk.errors.NotFound:
+            embed = discord.Embed(title="❌ Container Not Found", description=f"**{name}** no longer exists.", color=COLORS["critical"], timestamp=datetime.now(timezone.utc))
+        except Exception as e:
+            embed = discord.Embed(title="❌ Failed to Fetch Logs", description=f"Could not get logs for **{name}**.", color=COLORS["critical"], timestamp=datetime.now(timezone.utc))
+            log.error(f"Error fetching logs for '{name}': {e}")
+        embed.set_footer(text="docker-socket-watchdog", icon_url=DOCKER_THUMBNAIL)
+        await interaction.followup.send(embed=embed)
+
+    async def _inspect(self, interaction: Interaction):
+        if not await _check_authorization(interaction, self.authorized_role_ids):
+            return
+        await interaction.response.defer(ephemeral=False)
+        name = self.container_name
+        loop = asyncio.get_running_loop()
+        try:
+            def _do():
+                container = self.docker_client.containers.get(name)
+                container.reload()
+                attrs = container.attrs
+                state = attrs.get("State", {})
+                config_data = attrs.get("Config", {})
+                network = attrs.get("NetworkSettings", {})
+                host_config = attrs.get("HostConfig", {})
+                ports = network.get("Ports", {})
+                port_list = []
+                for cp, bindings in (ports or {}).items():
+                    if bindings:
+                        for b in bindings:
+                            port_list.append(f"{b.get('HostPort', '?')}→{cp}")
+                    else:
+                        port_list.append(f"(internal) {cp}")
+                return {
+                    "status": state.get("Status", "unknown"),
+                    "started_at": state.get("StartedAt", ""),
+                    "restart_count": attrs.get("RestartCount", 0),
+                    "image": config_data.get("Image", "unknown"),
+                    "cmd": " ".join(config_data.get("Cmd", []) or []),
+                    "ports": ", ".join(port_list) if port_list else "none",
+                    "memory_limit": host_config.get("Memory", 0),
+                    "restart_policy": host_config.get("RestartPolicy", {}).get("Name", "no"),
+                }
+            info = await loop.run_in_executor(None, _do)
+            embed = discord.Embed(
+                title=f"🔍 Inspect — {name}",
+                color=COLORS["info"],
+                timestamp=datetime.now(timezone.utc),
+            )
+            embed.set_thumbnail(url=DOCKER_THUMBNAIL)
+            embed.add_field(name="📊 Status", value=f"`{info['status']}`", inline=True)
+            embed.add_field(name="🔄 Restart Policy", value=f"`{info['restart_policy']}`", inline=True)
+            embed.add_field(name="🔁 Restarts", value=f"`{info['restart_count']}`", inline=True)
+            embed.add_field(name="🏷️ Image", value=f"`{info['image']}`", inline=True)
+            embed.add_field(name="🔌 Ports", value=f"`{info['ports']}`", inline=True)
+            if info["cmd"]:
+                embed.add_field(name="⌨️ Command", value=f"`{info['cmd'][:100]}`", inline=True)
+            if info["started_at"] and not info["started_at"].startswith("0001"):
+                embed.add_field(name="🕐 Started", value=f"`{info['started_at'][:19]}`", inline=True)
+            if info["memory_limit"] > 0:
+                embed.add_field(name="🧠 Memory Limit", value=f"`{info['memory_limit'] // 1048576}MB`", inline=True)
+        except docker_sdk.errors.NotFound:
+            embed = discord.Embed(title="❌ Container Not Found", description=f"**{name}** no longer exists.", color=COLORS["critical"], timestamp=datetime.now(timezone.utc))
+        except Exception as e:
+            embed = discord.Embed(title="❌ Inspect Failed", description=f"Could not inspect **{name}**.", color=COLORS["critical"], timestamp=datetime.now(timezone.utc))
+            log.error(f"Error inspecting '{name}': {e}")
+        embed.set_footer(text="docker-socket-watchdog", icon_url=DOCKER_THUMBNAIL)
+        # Send with a new management view for follow-up actions
+        new_view = ContainerManageView(name, self.docker_client, self.config)
+        await interaction.followup.send(embed=embed, view=new_view)
 
 
 # ─── Sentinel Discord Bot ────────────────────────────────────────────────────
@@ -954,12 +1130,8 @@ class SentinelBot(discord.Client):
 
     async def on_interaction(self, interaction: Interaction):
         """
-        Handle button clicks on messages from PREVIOUS bot sessions.
-
-        discord.py's on_interaction fires AFTER View dispatch. If the View
-        is still tracked in memory (current session), View callbacks handle
-        the interaction and this method does nothing (is_done check).
-        For old messages where no View is tracked, we handle them here.
+        Handle ALL button clicks — both current and previous session messages.
+        This is the central dispatcher for all persistent button interactions.
         """
         # Only handle component interactions (buttons)
         if interaction.type != discord.InteractionType.component:
@@ -971,116 +1143,89 @@ class SentinelBot(discord.Client):
         if not custom_id.startswith("dsw_"):
             return
 
-        # discord.py calls on_interaction AFTER trying to dispatch to
-        # tracked Views. If a tracked View handled it, response is done.
+        # If a View callback already handled this, skip
         if interaction.response.is_done():
             return
+
+        log.debug(f"🔘 on_interaction handling custom_id: {custom_id[:60]}")
 
         # Authorization check
         authorized_roles = self.config.authorized_role_ids if self.config else []
         if not await _check_authorization(interaction, authorized_roles):
             return
 
-        # Extract container name from custom_id and validate
-        if custom_id.startswith("dsw_restart_"):
-            container_name = custom_id[len("dsw_restart_"):]
-            if not _is_valid_container_name(container_name):
-                log.warning(f"🔒 Rejected invalid container name in custom_id: {custom_id[:60]}")
-                return
-            await self._handle_persistent_restart(interaction, container_name)
-        elif custom_id.startswith("dsw_skip_"):
-            container_name = custom_id[len("dsw_skip_"):]
-            if not _is_valid_container_name(container_name):
-                log.warning(f"🔒 Rejected invalid container name in custom_id: {custom_id[:60]}")
-                return
-            await self._handle_persistent_skip(interaction, container_name)
-        elif custom_id.startswith("dsw_start_"):
-            container_name = custom_id[len("dsw_start_"):]
-            if not _is_valid_container_name(container_name):
-                log.warning(f"🔒 Rejected invalid container name in custom_id: {custom_id[:60]}")
-                return
-            await self._handle_container_start(interaction, container_name)
-        elif custom_id.startswith("dsw_stop_"):
-            container_name = custom_id[len("dsw_stop_"):]
-            if not _is_valid_container_name(container_name):
-                log.warning(f"🔒 Rejected invalid container name in custom_id: {custom_id[:60]}")
-                return
-            await self._handle_container_stop(interaction, container_name)
-        elif custom_id.startswith("dsw_logs_"):
-            container_name = custom_id[len("dsw_logs_"):]
-            if not _is_valid_container_name(container_name):
-                log.warning(f"🔒 Rejected invalid container name in custom_id: {custom_id[:60]}")
-                return
-            await self._handle_container_logs(interaction, container_name)
-        elif custom_id.startswith("dsw_inspect_"):
-            container_name = custom_id[len("dsw_inspect_"):]
-            if not _is_valid_container_name(container_name):
-                log.warning(f"🔒 Rejected invalid container name in custom_id: {custom_id[:60]}")
-                return
-            await self._handle_container_inspect(interaction, container_name)
-        elif custom_id.startswith("dsw_dashboard_"):
-            # Dashboard buttons — create a new DashboardView and dispatch
-            dashboard_view = DashboardView(self.docker_client, self.config)
-            action = custom_id[len("dsw_dashboard_"):]
-            handler = {
-                "refresh": dashboard_view.refresh_callback,
-                "start_all": dashboard_view.start_all_callback,
-                "stop_all": dashboard_view.stop_all_callback,
-                "restart_all": dashboard_view.restart_all_callback,
-                "list": dashboard_view.list_callback,
-            }.get(action)
-            if handler:
-                await handler(interaction)
-        elif custom_id.startswith("dsw_start_"):
-            container_name = custom_id[len("dsw_start_"):]
-            if not _is_valid_container_name(container_name):
-                log.warning(f"🔒 Rejected invalid container name in custom_id: {custom_id[:60]}")
-                return
-            await self._handle_container_start(interaction, container_name)
-        elif custom_id.startswith("dsw_stop_"):
-            container_name = custom_id[len("dsw_stop_"):]
-            if not _is_valid_container_name(container_name):
-                log.warning(f"🔒 Rejected invalid container name in custom_id: {custom_id[:60]}")
-                return
-            await self._handle_container_stop(interaction, container_name)
-        elif custom_id.startswith("dsw_logs_"):
-            container_name = custom_id[len("dsw_logs_"):]
-            if not _is_valid_container_name(container_name):
-                log.warning(f"🔒 Rejected invalid container name in custom_id: {custom_id[:60]}")
-                return
-            await self._handle_container_logs(interaction, container_name)
-        elif custom_id.startswith("dsw_inspect_"):
-            container_name = custom_id[len("dsw_inspect_"):]
-            if not _is_valid_container_name(container_name):
-                log.warning(f"🔒 Rejected invalid container name in custom_id: {custom_id[:60]}")
-                return
-            await self._handle_container_inspect(interaction, container_name)
-        elif custom_id.startswith("dsw_dashboard_"):
-            # Dashboard buttons — create a new DashboardView and dispatch
-            dashboard_view = DashboardView(self.docker_client, self.config)
-            action = custom_id[len("dsw_dashboard_"):]
-            handler = {
-                "refresh": dashboard_view.refresh_callback,
-                "start_all": dashboard_view.start_all_callback,
-                "stop_all": dashboard_view.stop_all_callback,
-                "restart_all": dashboard_view.restart_all_callback,
-                "list": dashboard_view.list_callback,
-            }.get(action)
-            if handler:
-                await handler(interaction)
-        elif custom_id.startswith("dsw_sys_"):
-            # Docker system command buttons
-            sys_view = DockerSystemView(self.docker_client, self.config)
-            action = custom_id[len("dsw_sys_"):]
-            handler = {
-                "images": sys_view.images_callback,
-                "volumes": sys_view.volumes_callback,
-                "networks": sys_view.networks_callback,
-                "stats": sys_view.stats_callback,
-                "prune": sys_view.prune_callback,
-            }.get(action)
-            if handler:
-                await handler(interaction)
+        try:
+            # Extract container name from custom_id and validate
+            if custom_id.startswith("dsw_restart_"):
+                container_name = custom_id[len("dsw_restart_"):]
+                if not _is_valid_container_name(container_name):
+                    log.warning(f"🔒 Rejected invalid container name in custom_id: {custom_id[:60]}")
+                    return
+                await self._handle_persistent_restart(interaction, container_name)
+            elif custom_id.startswith("dsw_skip_"):
+                container_name = custom_id[len("dsw_skip_"):]
+                if not _is_valid_container_name(container_name):
+                    log.warning(f"🔒 Rejected invalid container name in custom_id: {custom_id[:60]}")
+                    return
+                await self._handle_persistent_skip(interaction, container_name)
+            elif custom_id.startswith("dsw_start_"):
+                container_name = custom_id[len("dsw_start_"):]
+                if not _is_valid_container_name(container_name):
+                    log.warning(f"🔒 Rejected invalid container name in custom_id: {custom_id[:60]}")
+                    return
+                await self._handle_container_start(interaction, container_name)
+            elif custom_id.startswith("dsw_stop_"):
+                container_name = custom_id[len("dsw_stop_"):]
+                if not _is_valid_container_name(container_name):
+                    log.warning(f"🔒 Rejected invalid container name in custom_id: {custom_id[:60]}")
+                    return
+                await self._handle_container_stop(interaction, container_name)
+            elif custom_id.startswith("dsw_logs_"):
+                container_name = custom_id[len("dsw_logs_"):]
+                if not _is_valid_container_name(container_name):
+                    log.warning(f"🔒 Rejected invalid container name in custom_id: {custom_id[:60]}")
+                    return
+                await self._handle_container_logs(interaction, container_name)
+            elif custom_id.startswith("dsw_inspect_"):
+                container_name = custom_id[len("dsw_inspect_"):]
+                if not _is_valid_container_name(container_name):
+                    log.warning(f"🔒 Rejected invalid container name in custom_id: {custom_id[:60]}")
+                    return
+                await self._handle_container_inspect(interaction, container_name)
+            elif custom_id.startswith("dsw_dashboard_"):
+                dashboard_view = DashboardView(self.docker_client, self.config)
+                action = custom_id[len("dsw_dashboard_"):]
+                handler = {
+                    "refresh": dashboard_view.refresh_callback,
+                    "start_all": dashboard_view.start_all_callback,
+                    "stop_all": dashboard_view.stop_all_callback,
+                    "restart_all": dashboard_view.restart_all_callback,
+                    "list": dashboard_view.list_callback,
+                }.get(action)
+                if handler:
+                    await handler(interaction)
+            elif custom_id.startswith("dsw_sys_"):
+                sys_view = DockerSystemView(self.docker_client, self.config)
+                action = custom_id[len("dsw_sys_"):]
+                handler = {
+                    "images": sys_view.images_callback,
+                    "volumes": sys_view.volumes_callback,
+                    "networks": sys_view.networks_callback,
+                    "stats": sys_view.stats_callback,
+                    "prune": sys_view.prune_callback,
+                }.get(action)
+                if handler:
+                    await handler(interaction)
+        except Exception as e:
+            log.error(f"Error handling interaction {custom_id[:60]}: {e}")
+            # Try to respond if not already done
+            if not interaction.response.is_done():
+                try:
+                    await interaction.response.send_message(
+                        "❌ An error occurred. Please try again.", ephemeral=True
+                    )
+                except Exception:
+                    pass
 
     async def _handle_persistent_restart(self, interaction: Interaction, container_name: str):
         """Handle restart button click from a previous bot session's message."""
