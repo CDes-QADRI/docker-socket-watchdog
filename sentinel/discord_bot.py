@@ -540,11 +540,22 @@ class DashboardView(View):
         loop = asyncio.get_running_loop()
         containers = await loop.run_in_executor(None, self._get_all_containers)
 
-        # Send per-container cards with action buttons (max 5 per message due to Discord limits)
-        for i in range(0, len(containers), 5):
-            batch = containers[i:i+5]
+        if not containers:
             embed = discord.Embed(
-                title=f"📋 Container List ({i+1}–{min(i+5, len(containers))} of {len(containers)})",
+                title="📋 Container List",
+                description="No containers found.",
+                color=COLORS["warning"],
+                timestamp=datetime.now(timezone.utc),
+            )
+            embed.set_footer(text="docker-socket-watchdog", icon_url=DOCKER_THUMBNAIL)
+            await interaction.followup.send(embed=embed)
+            return
+
+        # Send per-container cards — 2 containers per message (up to 10 buttons)
+        for i in range(0, len(containers), 2):
+            batch = containers[i:i+2]
+            embed = discord.Embed(
+                title=f"📋 Containers ({i+1}–{min(i+2, len(containers))} of {len(containers)})",
                 color=COLORS["info"],
                 timestamp=datetime.now(timezone.utc),
             )
@@ -553,8 +564,9 @@ class DashboardView(View):
             view = View(timeout=None)
             for c in batch:
                 status_emoji = "🟢" if c["status"] == "running" else "🔴"
+                health_str = f" ({c['health']})" if c.get("health") and c["health"] != "N/A" else ""
                 embed.add_field(
-                    name=f"{status_emoji} {c['name']}",
+                    name=f"{status_emoji} {c['name']}{health_str}",
                     value=(
                         f"**Status:** `{c['status']}`\n"
                         f"**Image:** `{c['image']}`\n"
@@ -563,20 +575,18 @@ class DashboardView(View):
                     inline=True,
                 )
 
-                # Add per-container action button
+                name = c["name"]
+                short = name[:15]
+
+                # Row of buttons per container
                 if c["status"] == "running":
-                    btn = Button(
-                        style=ButtonStyle.danger,
-                        label=f"⏹ {c['name'][:20]}",
-                        custom_id=f"dsw_stop_{c['name']}",
-                    )
+                    view.add_item(Button(style=ButtonStyle.danger, label=f"⏹ {short}", custom_id=f"dsw_stop_{name}"))
+                    view.add_item(Button(style=ButtonStyle.success, label=f"🔄 {short}", custom_id=f"dsw_restart_{name}"))
                 else:
-                    btn = Button(
-                        style=ButtonStyle.success,
-                        label=f"▶ {c['name'][:20]}",
-                        custom_id=f"dsw_start_{c['name']}",
-                    )
-                view.add_item(btn)
+                    view.add_item(Button(style=ButtonStyle.success, label=f"▶ {short}", custom_id=f"dsw_start_{name}"))
+
+                view.add_item(Button(style=ButtonStyle.primary, label=f"📜 {short}", custom_id=f"dsw_logs_{name}"))
+                view.add_item(Button(style=ButtonStyle.secondary, label=f"🔍 {short}", custom_id=f"dsw_inspect_{name}"))
 
             embed.set_footer(text="docker-socket-watchdog", icon_url=DOCKER_THUMBNAIL)
             await interaction.followup.send(embed=embed, view=view)
