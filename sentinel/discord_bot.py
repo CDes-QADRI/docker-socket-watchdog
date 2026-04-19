@@ -1130,8 +1130,11 @@ class SentinelBot(discord.Client):
 
     async def on_interaction(self, interaction: Interaction):
         """
-        Handle ALL button clicks — both current and previous session messages.
-        This is the central dispatcher for all persistent button interactions.
+        Fallback handler for button clicks from PREVIOUS bot sessions.
+        
+        Current-session buttons are handled by View callbacks directly.
+        This handler catches buttons from old messages where the View
+        is no longer tracked in memory.
         """
         # Only handle component interactions (buttons)
         if interaction.type != discord.InteractionType.component:
@@ -1143,11 +1146,14 @@ class SentinelBot(discord.Client):
         if not custom_id.startswith("dsw_"):
             return
 
+        # Give View dispatch time to handle current-session buttons first
+        await asyncio.sleep(0.5)
+
         # If a View callback already handled this, skip
         if interaction.response.is_done():
             return
 
-        log.debug(f"🔘 on_interaction handling custom_id: {custom_id[:60]}")
+        log.info(f"🔘 Persistent handler for old-session button: {custom_id[:60]}")
 
         # Authorization check
         authorized_roles = self.config.authorized_role_ids if self.config else []
