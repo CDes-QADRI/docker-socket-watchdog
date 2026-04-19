@@ -35,8 +35,9 @@ Thumbs.db
 *.tar
 docker-compose.override.yml
 
-# Testing
+# Testing / Personal scripts
 stress_test.py
 htmlcov/
 .coverage
 test_sentinel.sh
+tests/
