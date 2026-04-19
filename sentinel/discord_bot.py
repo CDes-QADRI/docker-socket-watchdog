@@ -52,6 +52,18 @@ def _is_valid_container_name(name: str) -> bool:
     return bool(name and _VALID_CONTAINER_NAME.match(name))
 
 
+def _progress_bar(percent: float, length: int = 10) -> str:
+    """Generate a visual progress bar using Unicode blocks."""
+    filled = int(min(percent, 100) / 100 * length)
+    empty = length - filled
+    if percent >= 90:
+        return "🟥" * filled + "⬛" * empty
+    elif percent >= 70:
+        return "🟧" * filled + "⬛" * empty
+    else:
+        return "🟩" * filled + "⬛" * empty
+
+
 async def _check_authorization(interaction: Interaction, authorized_role_ids: list) -> bool:
     """
     Check if the user clicking a button is authorized.
@@ -1475,7 +1487,7 @@ class SentinelBot(discord.Client):
 
     async def _send_interactive_alert(self, event):
         """
-        Send a crash/issue alert WITH Restart/Skip buttons to Discord.
+        Send a crash/issue alert WITH action buttons to Discord.
         Called from the events thread via thread-safe scheduling.
         """
         if not rate_limiter.allow(event.container_name):
@@ -1492,9 +1504,40 @@ class SentinelBot(discord.Client):
         severity = event.severity
         color = COLORS.get(severity, COLORS["info"])
 
+        # Build rich embed with event-type-specific styling
+        action_lower = event.action.lower() if event.action else ""
+
+        if action_lower == "die" or action_lower == "kill":
+            title = f"💀 Container Crashed — {event.container_name}"
+            status_line = "**STOPPED** — Container has exited unexpectedly"
+        elif action_lower == "start":
+            title = f"▶️ Container Started — {event.container_name}"
+            status_line = "**RUNNING** — Container is now active"
+        elif action_lower == "stop":
+            title = f"⏹️ Container Stopped — {event.container_name}"
+            status_line = "**STOPPED** — Container was gracefully stopped"
+        elif action_lower == "restart":
+            title = f"🔄 Container Restarted — {event.container_name}"
+            status_line = "**RESTARTING** — Container is restarting"
+        elif action_lower == "create":
+            title = f"🆕 Container Created — {event.container_name}"
+            status_line = "**CREATED** — New container initialized"
+        elif action_lower == "destroy" or action_lower == "remove":
+            title = f"🗑️ Container Removed — {event.container_name}"
+            status_line = "**REMOVED** — Container has been deleted"
+        elif action_lower == "pause":
+            title = f"⏸️ Container Paused — {event.container_name}"
+            status_line = "**PAUSED** — Container is frozen"
+        elif action_lower == "unpause":
+            title = f"▶️ Container Unpaused — {event.container_name}"
+            status_line = "**RUNNING** — Container resumed"
+        else:
+            title = f"{event.emoji} {event.description}"
+            status_line = f"**{event.action.upper()}** — Event detected"
+
         embed = discord.Embed(
-            title=f"{event.emoji} {event.description}",
-            description=f"**{event.container_name}** → `{event.action}`",
+            title=title,
+            description=f"━━━━━━━━━━━━━━━━━━━━━━\n{status_line}\n━━━━━━━━━━━━━━━━━━━━━━",
             color=color,
             timestamp=datetime.now(timezone.utc),
         )
@@ -1513,18 +1556,20 @@ class SentinelBot(discord.Client):
             value=f"<t:{int(event.timestamp.timestamp())}:T>",
             inline=True,
         )
+        embed.add_field(name="📡 Event", value=f"`{event.action}`", inline=True)
 
         if event.needs_attention:
             embed.add_field(
-                name="🎯 Action",
-                value="👇 **Click a button below** to restart or skip this container.",
+                name="━━━━━━━━━━━━━━━━",
+                value="👇 **Take action below:**",
                 inline=False,
             )
 
-        embed.set_footer(text="docker-socket-watchdog", icon_url=DOCKER_THUMBNAIL)
+        embed.set_footer(text="docker-socket-watchdog • Real-Time Monitor", icon_url=DOCKER_THUMBNAIL)
 
-        # Create the view with buttons (only for events needing attention)
+        # Create the view with buttons
         if event.needs_attention:
+            # Crash events — Restart/Skip buttons
             timeout = self.config.restart_timeout if self.config else 30
             authorized = self.config.authorized_role_ids if self.config else []
             view = ContainerActionView(
@@ -1536,8 +1581,9 @@ class SentinelBot(discord.Client):
             )
             await channel.send(embed=embed, view=view)
         else:
-            # Informational events — no buttons needed
-            await channel.send(embed=embed)
+            # Informational events — still add management buttons
+            view = ContainerManageView(event.container_name, self.docker_client, self.config)
+            await channel.send(embed=embed, view=view)
 
     async def _send_resource_alert(self, alert):
         """
@@ -1557,16 +1603,23 @@ class SentinelBot(discord.Client):
 
         color = COLORS.get(alert.severity, COLORS["warning"])
 
+        # Build visual resource bars
+        ram_bar = _progress_bar(alert.mem_percent)
+        cpu_bar = _progress_bar(alert.cpu_percent)
+
         if alert.severity == "critical":
-            title = f"🚨 CRITICAL — {alert.emoji} Resource Spike!"
+            title = f"🚨 CRITICAL RESOURCE SPIKE — {alert.container_name}"
             desc = (
-                f"**{alert.container_name}** is consuming dangerously high resources.\n"
-                f"⚠️ **A crash or OOM kill may be imminent!**"
+                f"━━━━━━━━━━━━━━━━━━━━━━\n"
+                f"⚠️ **A crash or OOM kill may be imminent!**\n"
+                f"━━━━━━━━━━━━━━━━━━━━━━"
             )
         else:
-            title = f"⚠️ WARNING — {alert.emoji} High Resource Usage"
+            title = f"⚠️ HIGH RESOURCE USAGE — {alert.container_name}"
             desc = (
-                f"**{alert.container_name}** is exceeding resource thresholds."
+                f"━━━━━━━━━━━━━━━━━━━━━━\n"
+                f"Container is exceeding resource thresholds\n"
+                f"━━━━━━━━━━━━━━━━━━━━━━"
             )
 
         embed = discord.Embed(
@@ -1583,24 +1636,26 @@ class SentinelBot(discord.Client):
             name="🏷️ Image", value=f"`{alert.image}`", inline=True
         )
         embed.add_field(
-            name="🧠 RAM",
-            value=f"**{alert.mem_percent:.1f}%** ({alert.mem_usage_mb:.0f}MB / {alert.mem_limit_mb:.0f}MB)",
-            inline=True,
-        )
-        embed.add_field(
-            name="🔥 CPU", value=f"**{alert.cpu_percent:.1f}%**", inline=True
-        )
-        embed.add_field(
             name="⏰ Detected At",
             value=f"<t:{int(alert.timestamp.timestamp())}:T>",
             inline=True,
         )
         embed.add_field(
-            name="🎯 Action",
-            value="👇 **Click a button below** to restart or skip this container.",
+            name="🧠 RAM Usage",
+            value=f"{ram_bar} **{alert.mem_percent:.1f}%**\n`{alert.mem_usage_mb:.0f}MB / {alert.mem_limit_mb:.0f}MB`",
             inline=False,
         )
-        embed.set_footer(text="docker-socket-watchdog", icon_url=DOCKER_THUMBNAIL)
+        embed.add_field(
+            name="🔥 CPU Usage",
+            value=f"{cpu_bar} **{alert.cpu_percent:.1f}%**",
+            inline=False,
+        )
+        embed.add_field(
+            name="━━━━━━━━━━━━━━━━",
+            value="👇 **Take action below:**",
+            inline=False,
+        )
+        embed.set_footer(text="docker-socket-watchdog • Resource Monitor", icon_url=DOCKER_THUMBNAIL)
 
         timeout = self.config.restart_timeout if self.config else 30
         authorized = self.config.authorized_role_ids if self.config else []
@@ -1656,11 +1711,19 @@ class SentinelBot(discord.Client):
         color = COLORS.get(severity, COLORS["warning"])
 
         if severity == "critical":
-            title = "🚨 CRITICAL — Container Down!"
-            desc = "A container has **crashed** and needs attention."
+            title = f"🚨 CRITICAL — {container_info.name} is DOWN!"
+            desc = (
+                f"━━━━━━━━━━━━━━━━━━━━━━\n"
+                f"Container has **crashed** and needs immediate attention\n"
+                f"━━━━━━━━━━━━━━━━━━━━━━"
+            )
         else:
-            title = "⚠️ WARNING — Container Unhealthy"
-            desc = "A container is **not running properly** and may need a restart."
+            title = f"⚠️ WARNING — {container_info.name} Unhealthy"
+            desc = (
+                f"━━━━━━━━━━━━━━━━━━━━━━\n"
+                f"Container is **not running properly** and may need a restart\n"
+                f"━━━━━━━━━━━━━━━━━━━━━━"
+            )
 
         embed = discord.Embed(
             title=title,
@@ -1669,19 +1732,11 @@ class SentinelBot(discord.Client):
             timestamp=datetime.now(timezone.utc),
         )
         embed.set_thumbnail(url=DOCKER_THUMBNAIL)
-        embed.add_field(
-            name="📦 Container",
-            value=f"```\n{container_info.name}\n```",
-            inline=True,
-        )
-        embed.add_field(
-            name="🏷️ Image",
-            value=f"```\n{container_info.image}\n```",
-            inline=True,
-        )
+        embed.add_field(name="📦 Container", value=f"`{container_info.name}`", inline=True)
+        embed.add_field(name="🏷️ Image", value=f"`{container_info.image}`", inline=True)
         embed.add_field(
             name="📊 Status",
-            value=f"```\n{container_info.status.upper()}\n```",
+            value=f"`{container_info.status.upper()}`",
             inline=True,
         )
         embed.add_field(
@@ -1689,21 +1744,9 @@ class SentinelBot(discord.Client):
             value=container_info.reason,
             inline=False,
         )
-        embed.add_field(
-            name="⏱️ Downtime",
-            value=f"`{container_info.downtime}`",
-            inline=True,
-        )
-        embed.add_field(
-            name="🔢 Exit Code",
-            value=f"`{container_info.exit_code}`",
-            inline=True,
-        )
-        embed.add_field(
-            name="🆔 Container ID",
-            value=f"`{container_info.id_short}`",
-            inline=True,
-        )
+        embed.add_field(name="⏱️ Downtime", value=f"`{container_info.downtime}`", inline=True)
+        embed.add_field(name="🔢 Exit Code", value=f"`{container_info.exit_code}`", inline=True)
+        embed.add_field(name="🆔 Container ID", value=f"`{container_info.id_short}`", inline=True)
 
         if container_info.error_msg:
             embed.add_field(
@@ -1723,11 +1766,11 @@ class SentinelBot(discord.Client):
             )
 
         embed.add_field(
-            name="🎯 Action",
-            value="👇 **Click a button below** to restart or skip this container.",
+            name="━━━━━━━━━━━━━━━━",
+            value="👇 **Take action below:**",
             inline=False,
         )
-        embed.set_footer(text="docker-socket-watchdog", icon_url=DOCKER_THUMBNAIL)
+        embed.set_footer(text="docker-socket-watchdog • Periodic Scan", icon_url=DOCKER_THUMBNAIL)
 
         timeout = self.config.restart_timeout if self.config else 30
         authorized = self.config.authorized_role_ids if self.config else []
