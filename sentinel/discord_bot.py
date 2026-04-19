@@ -23,8 +23,8 @@ from sentinel.alerter import rate_limiter
 
 try:
     import discord
-    from discord import ButtonStyle, Interaction
-    from discord.ui import View, Button
+    from discord import ButtonStyle, Interaction, TextStyle
+    from discord.ui import View, Button, Modal, TextInput
     DISCORD_PY_AVAILABLE = True
 except ImportError:
     DISCORD_PY_AVAILABLE = False
@@ -283,6 +283,145 @@ class ContainerActionView(View):
                 pass
 
 
+# ─── Create Container Modal ───────────────────────────────────────────────────
+
+class CreateContainerModal(Modal):
+    """Modal form to collect new container configuration from Discord."""
+
+    def __init__(self, docker_client, config=None):
+        super().__init__(title="🐳 Create New Container")
+        self.docker_client = docker_client
+        self.config = config
+
+        self.container_name = TextInput(
+            label="Container Name",
+            placeholder="e.g. my-nginx",
+            required=True,
+            max_length=100,
+        )
+        self.add_item(self.container_name)
+
+        self.image_name = TextInput(
+            label="Image (pulled automatically if missing)",
+            placeholder="e.g. nginx:latest, redis:7, postgres:16",
+            required=True,
+            max_length=200,
+        )
+        self.add_item(self.image_name)
+
+        self.ports = TextInput(
+            label="Port Mapping (host:container, comma-sep)",
+            placeholder="e.g. 8080:80, 3306:3306",
+            required=False,
+            max_length=300,
+        )
+        self.add_item(self.ports)
+
+        self.env_vars = TextInput(
+            label="Environment Variables (KEY=VAL, one per line)",
+            style=TextStyle.long,
+            placeholder="POSTGRES_PASSWORD=secret\nPOSTGRES_DB=mydb",
+            required=False,
+            max_length=1000,
+        )
+        self.add_item(self.env_vars)
+
+        self.restart_policy = TextInput(
+            label="Restart Policy",
+            placeholder="no | always | on-failure | unless-stopped",
+            required=False,
+            default="unless-stopped",
+            max_length=30,
+        )
+        self.add_item(self.restart_policy)
+
+    async def on_submit(self, interaction: Interaction):
+        await interaction.response.defer(ephemeral=False)
+
+        name = sanitize(str(self.container_name).strip())
+        image = str(self.image_name).strip()
+        ports_raw = str(self.ports).strip()
+        env_raw = str(self.env_vars).strip()
+        restart_raw = str(self.restart_policy).strip() or "unless-stopped"
+
+        # Parse ports: "8080:80, 3306:3306" -> {"8080/tcp": 80, ...}
+        port_bindings = {}
+        if ports_raw:
+            for mapping in ports_raw.split(","):
+                mapping = mapping.strip()
+                if ":" in mapping:
+                    parts = mapping.split(":")
+                    host_port = parts[0].strip()
+                    container_port = parts[1].strip()
+                    port_bindings[f"{container_port}/tcp"] = int(host_port)
+
+        # Parse env vars
+        environment = []
+        if env_raw:
+            for line in env_raw.splitlines():
+                line = line.strip()
+                if "=" in line:
+                    environment.append(line)
+
+        # Validate restart policy
+        valid_policies = {"no", "always", "on-failure", "unless-stopped"}
+        if restart_raw not in valid_policies:
+            restart_raw = "unless-stopped"
+
+        loop = asyncio.get_running_loop()
+
+        def _create():
+            # Pull image if not available
+            try:
+                self.docker_client.images.get(image)
+            except docker_sdk.errors.ImageNotFound:
+                self.docker_client.images.pull(image)
+
+            container = self.docker_client.containers.run(
+                image=image,
+                name=name,
+                ports=port_bindings if port_bindings else None,
+                environment=environment if environment else None,
+                restart_policy={"Name": restart_raw},
+                detach=True,
+            )
+            return container
+
+        try:
+            container = await loop.run_in_executor(None, _create)
+            embed = discord.Embed(
+                title="✅ Container Created Successfully",
+                color=COLORS["success"],
+                timestamp=datetime.now(timezone.utc),
+            )
+            embed.add_field(name="📛 Name", value=f"`{name}`", inline=True)
+            embed.add_field(name="🏷️ Image", value=f"`{image}`", inline=True)
+            embed.add_field(name="🆔 ID", value=f"`{container.short_id}`", inline=True)
+            if ports_raw:
+                embed.add_field(name="🔌 Ports", value=f"`{ports_raw}`", inline=False)
+            if environment:
+                # Show keys only, not values (security)
+                keys = [e.split("=")[0] for e in environment]
+                embed.add_field(name="🔑 Env Vars", value=f"`{', '.join(keys)}`", inline=False)
+            embed.add_field(name="🔄 Restart", value=f"`{restart_raw}`", inline=True)
+            embed.set_footer(text="docker-socket-watchdog", icon_url=DOCKER_THUMBNAIL)
+
+            view = ContainerManageView(name, self.docker_client, self.config)
+            await interaction.followup.send(embed=embed, view=view)
+
+        except Exception as e:
+            embed = discord.Embed(
+                title="❌ Container Creation Failed",
+                description=f"```\n{str(e)[:1500]}\n```",
+                color=COLORS["critical"],
+                timestamp=datetime.now(timezone.utc),
+            )
+            embed.add_field(name="📛 Name", value=f"`{name}`", inline=True)
+            embed.add_field(name="🏷️ Image", value=f"`{image}`", inline=True)
+            embed.set_footer(text="docker-socket-watchdog", icon_url=DOCKER_THUMBNAIL)
+            await interaction.followup.send(embed=embed)
+
+
 # ─── Dashboard View (Docker Management) ───────────────────────────────────────
 
 class DashboardView(View):
@@ -334,6 +473,15 @@ class DashboardView(View):
         )
         list_btn.callback = self.list_callback
         self.add_item(list_btn)
+
+        add_btn = Button(
+            style=ButtonStyle.success,
+            label="➕ Add New Container",
+            custom_id="dsw_dashboard_add",
+            row=1,
+        )
+        add_btn.callback = self.add_container_callback
+        self.add_item(add_btn)
 
     def _get_all_containers(self):
         """Get all containers with their details."""
@@ -579,6 +727,13 @@ class DashboardView(View):
 
             view = ContainerManageView(c["name"], self.docker_client, self.config)
             await interaction.followup.send(embed=embed, view=view)
+
+    async def add_container_callback(self, interaction: Interaction):
+        """Open modal to create a new container."""
+        if not await _check_authorization(interaction, self.authorized_role_ids):
+            return
+        modal = CreateContainerModal(self.docker_client, self.config)
+        await interaction.response.send_modal(modal)
 
 
 # ─── Docker System Commands View ───────────────────────────────────────────────
@@ -1207,6 +1362,7 @@ class SentinelBot(discord.Client):
                     "stop_all": dashboard_view.stop_all_callback,
                     "restart_all": dashboard_view.restart_all_callback,
                     "list": dashboard_view.list_callback,
+                    "add": dashboard_view.add_container_callback,
                 }.get(action)
                 if handler:
                     await handler(interaction)
